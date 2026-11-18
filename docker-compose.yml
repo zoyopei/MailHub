@@ -7,6 +7,7 @@ services:
     build: .
     image: mailhub:latest
     restart: unless-stopped
+    user: "1000"                     # 非 root 运行（镜像默认即 1000；自定义改此处，bind mount 需宿主目录属主匹配）
     ports: ["18099:18099"]
     volumes: ["mailhub-data:/data"]
     ulimits: { nofile: 8192 }        # 千级 IMAP 长连接需要（DESIGN.md 2.2）

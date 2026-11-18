@@ -20,14 +20,21 @@ COPY . .
 # 用真实前端产物覆盖占位 index.html（web/embed.go 内嵌）
 COPY --from=web /src/web/dist web/dist
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/mailhub ./cmd/mailhub
+# 预建空 /data（属主在最终阶段按运行 UID 授予）
+RUN mkdir -p /out/data
 
 # ---- 阶段 3：最小运行时 ----
-# distroless/static 含 CA 证书（Graph/token 端点 HTTPS 必需）与 tzdata；nonroot 非 root 运行。
+# distroless/static 含 CA 证书（Graph/token 端点 HTTPS 必需）与 tzdata。
+# 非 root 运行：默认 UID 1000，构建时可 --build-arg MAILHUB_UID=<n> 自定义；
+# 运行时亦可用 docker run -u / compose user: 覆盖（bind mount 时需宿主目录属主匹配）。
 FROM gcr.io/distroless/static-debian12:nonroot
+ARG MAILHUB_UID=1000
 COPY --from=build /out/mailhub /mailhub
-# 容器内必须监听 0.0.0.0（默认 ":8080" 亦可；此处固定 18099 与仓库部署一致）
+# named volume 首次初始化会继承镜像内目录的属主，保证非 root 也可写 /data
+COPY --from=build --chown=${MAILHUB_UID}:${MAILHUB_UID} /out/data /data
 ENV MAILHUB_LISTEN=:18099 \
     MAILHUB_DATA_DIR=/data
 EXPOSE 18099
 VOLUME /data
+USER ${MAILHUB_UID}
 ENTRYPOINT ["/mailhub"]

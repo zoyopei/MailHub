@@ -55,10 +55,31 @@ jobs:
         run: npm run build
 
   docker:
-    name: Docker 镜像构建验证
+    name: Docker 镜像构建与运行验证
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: 构建镜像（多阶段：前端 → Go → distroless；不推送）
         run: docker build -t mailhub:ci .
+
+      - name: 运行验证（非 root 启动 + healthz）
+        run: |
+          SECRET=$(openssl rand -base64 32)
+          docker run -d --name mailhub-ci \
+            -e MAILHUB_API_TOKEN=ci-token \
+            -e MAILHUB_SECRET_KEY="$SECRET" \
+            -p 18099:18099 mailhub:ci
+          for i in $(seq 1 15); do
+            if curl -sf http://127.0.0.1:18099/healthz > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:18099/healthz && echo " <- healthz ok"
+          # 镜像声明 USER=1000，且实际进程以该 UID 运行（docker top 的 UID 列）
+          uid=$(docker inspect --format '{{.Config.User}}' mailhub:ci)
+          echo "镜像 USER=$uid"
+          [ "$uid" = "1000" ]
+          run_uid=$(docker top mailhub-ci | awk 'NR==2{print $1}')
+          echo "运行 UID=$run_uid"
+          [ "$run_uid" = "1000" ]
+          docker rm -f mailhub-ci

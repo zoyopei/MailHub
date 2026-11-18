@@ -35,6 +35,16 @@ export MAILHUB_SECRET_KEY=<上一步生成>
 docker compose up -d --build
 ```
 
+容器**默认以非 root（UID 1000）运行**；自定义 UID 两种方式：
+
+```bash
+docker build --build-arg MAILHUB_UID=1500 -t mailhub .   # 构建期
+# 或运行期（compose 里改 user: "1500"）
+docker run -u 1500 ... mailhub
+```
+
+> bind mount 挂载 `data/` 时宿主目录属主需与运行 UID 匹配；named volume 首次初始化会自动继承镜像内 `/data` 属主。
+
 ### 批量导入账号
 
 每行 `邮箱----密码----client_id----令牌`（与前身工具 main.py 的账号文件逐字兼容；Outlook/Hotmail 的密码段为占位符，不存储）：
