@@ -63,10 +63,11 @@ jobs:
       - name: 构建镜像（多阶段：前端 → Go → distroless；不推送）
         run: docker build -t mailhub:ci .
 
-      - name: 运行验证（非 root 启动 + healthz）
+      - name: 运行验证（部署侧指定 UID 1000:1000 + healthz）
         run: |
           SECRET=$(openssl rand -base64 32)
           docker run -d --name mailhub-ci \
+            -u 1000:1000 \
             -e MAILHUB_API_TOKEN=ci-token \
             -e MAILHUB_SECRET_KEY="$SECRET" \
             -p 18099:18099 mailhub:ci
@@ -74,11 +75,8 @@ jobs:
             if curl -sf http://127.0.0.1:18099/healthz > /dev/null; then break; fi
             sleep 1
           done
-          curl -sf http://127.0.0.1:18099/healthz && echo " <- healthz ok"
-          # 镜像声明 USER=1000，且实际进程以该 UID 运行（docker top 的 UID 列）
-          uid=$(docker inspect --format '{{.Config.User}}' mailhub:ci)
-          echo "镜像 USER=$uid"
-          [ "$uid" = "1000" ]
+          curl -sf http://127.0.0.1:18099/healthz && echo " <- healthz ok（含 /data 可写验证：SQLite 建库成功）"
+          # 镜像不绑定用户（部署侧 -u/compose user 指定）：验证指定 UID 实际生效
           pid=$(docker inspect --format '{{.State.Pid}}' mailhub-ci)
           run_uid=$(awk '/^Uid:/ {print $2}' /proc/$pid/status)
           echo "运行 UID=$run_uid"

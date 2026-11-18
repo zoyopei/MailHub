@@ -25,16 +25,14 @@ RUN mkdir -p /out/data
 
 # ---- 阶段 3：最小运行时 ----
 # distroless/static 含 CA 证书（Graph/token 端点 HTTPS 必需）与 tzdata。
-# 非 root 运行：默认 UID 1000，构建时可 --build-arg MAILHUB_UID=<n> 自定义；
-# 运行时亦可用 docker run -u / compose user: 覆盖（bind mount 时需宿主目录属主匹配）。
-FROM gcr.io/distroless/static-debian12:nonroot
-ARG MAILHUB_UID=1000
+# 镜像不绑定运行用户（base 用默认 tag，非 nonroot）：UID/GID 完全由部署侧指定——
+# docker-compose 默认 user: "1000:1000"，裸 docker run 请自行 -u <uid>:<gid>（默认 root）。
+# /data 预授权 1000:1000 与 compose 默认一致：named volume 首次初始化继承镜像内属主。
+FROM gcr.io/distroless/static-debian12
 COPY --from=build /out/mailhub /mailhub
-# named volume 首次初始化会继承镜像内目录的属主，保证非 root 也可写 /data
-COPY --from=build --chown=${MAILHUB_UID}:${MAILHUB_UID} /out/data /data
+COPY --from=build --chown=1000:1000 /out/data /data
 ENV MAILHUB_LISTEN=:18099 \
     MAILHUB_DATA_DIR=/data
 EXPOSE 18099
 VOLUME /data
-USER ${MAILHUB_UID}
 ENTRYPOINT ["/mailhub"]

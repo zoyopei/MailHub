@@ -35,15 +35,18 @@ export MAILHUB_SECRET_KEY=<上一步生成>
 docker compose up -d --build
 ```
 
-容器**默认以非 root（UID 1000）运行**；自定义 UID 两种方式：
+容器镜像**不绑定运行用户**，UID/GID 由部署侧指定（compose 默认 `user: "1000:1000"` 非 root）：
 
-```bash
-docker build --build-arg MAILHUB_UID=1500 -t mailhub .   # 构建期
-# 或运行期（compose 里改 user: "1500"）
-docker run -u 1500 ... mailhub
+```yaml
+# docker-compose.yml
+user: "1000:1000"   # 自定义改此处；bind mount 时宿主目录属主需匹配
 ```
 
-> bind mount 挂载 `data/` 时宿主目录属主需与运行 UID 匹配；named volume 首次初始化会自动继承镜像内 `/data` 属主。
+```bash
+docker run -u 1000:1000 ... zoyopei/mailhub   # 裸 docker run 请自行 -u（默认 root）
+```
+
+> named volume 首次初始化会自动继承镜像内 `/data`（属主 1000:1000）；换用其他 UID 时 bind mount 需 `chown`，named volume 需重建。
 
 ### 批量导入账号
 
