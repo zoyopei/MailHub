@@ -172,6 +172,7 @@ func TestBatchImportTextPlain(t *testing.T) {
 
 	var out struct {
 		Created int `json:"created"`
+		Skipped int `json:"skipped"`
 		Failed  []struct {
 			Line  int    `json:"line"`
 			Error string `json:"error"`
@@ -183,8 +184,11 @@ func TestBatchImportTextPlain(t *testing.T) {
 	if out.Created != 2 {
 		t.Errorf("created = %d（应为 2：a1、a2）", out.Created)
 	}
-	if len(out.Failed) != 2 {
-		t.Fatalf("failed = %+v（应为 2：坏行 + 重复）", out.Failed)
+	if out.Skipped != 1 {
+		t.Errorf("skipped = %d（应为 1：重复邮箱不覆盖计入 skipped）", out.Skipped)
+	}
+	if len(out.Failed) != 1 {
+		t.Fatalf("failed = %+v（应为 1：仅坏行；重复属 skipped）", out.Failed)
 	}
 	// Outlook 域名预设生效
 	a, err := st.GetAccountByEmail("a1@outlook.com")

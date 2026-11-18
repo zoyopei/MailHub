@@ -414,7 +414,8 @@ X-MailHub-Signature: sha256=<hex(HMAC_SHA256(secret, timestamp + "." + body))>
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/accounts` | 添加单个账号。**先同步验证 IMAP 登录**，失败直接返回 400，成功后入库并启动 worker |
-| `POST` | `/accounts/batch` | **批量导入**。支持 JSON 数组或 `text/plain` 粘贴 `邮箱----密码----client_id----令牌` 文本（与 main.py 账号文件逐字兼容；Outlook/Hotmail 域名自动套用 oauth2 + **graph 传输**预设，密码段不存储）。只入库（`pending`），后台错峰验证（2.2），立即返回统计 |
+| `POST` | `/accounts/batch` | **批量导入**。支持 JSON 数组或 `text/plain` 粘贴 `邮箱----密码----client_id----令牌` 文本（与 main.py 账号文件逐字兼容；Outlook/Hotmail 域名自动套用 oauth2 + **graph 传输**预设，密码段不存储）。只入库（`pending`），后台错峰验证（2.2），立即返回统计；**已存在邮箱跳过不覆盖**（`skipped` 计数）；JSON 模式与导出格式同构，迁移文件可直接导入（名称/文件夹/轮询/提醒/标签一并还原） |
+| `GET` | `/accounts/export` | **导出（迁移）**。裸 JSON 数组与批量导入 JSON 模式同构，POST 回 `/accounts/batch` 即闭环迁移。默认仅配置；`include_credentials=true` 附解密凭据明文——这是"凭据绝不回显"的**显式例外**（迁移必需），文件明文由调用方妥善保管；`q`/`status`/`tag` 筛选同列表。不含已收邮件 |
 | `GET` | `/accounts` | 账号列表（分页）。参数：`page`/`limit`、`q`（名称/邮箱模糊）、`status`（如 `auth_failed`）、`tag`（可重复，OR 命中）。响应每项含 `tags: []` |
 | `GET` | `/tags` | 全部标签与引用账号数（按引用数降序） |
 | `GET` | `/accounts/{id}` | 账号详情。回显可编辑字段当前值（`folders`/`poll_interval`/`username`/`imap_port`/`client_id` 等，供 Web 单账号设置弹窗使用）；密码/refresh_token **绝不回显** |

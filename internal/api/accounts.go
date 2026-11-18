@@ -60,6 +60,7 @@ func (s *Server) mountAccounts(r chi.Router) {
 	r.Post("/accounts/sync", s.handleAccountsSyncBatch)
 	r.Patch("/accounts/batch", s.handleAccountBatchPatch)
 	r.Get("/accounts", s.handleAccountList)
+	r.Get("/accounts/export", s.handleAccountExport) // 静态段优先于 /accounts/{id}
 	r.Post("/accounts/test", s.handleAccountTest)
 	r.Get("/accounts/{id}", s.handleAccountGet)
 	r.Patch("/accounts/{id}", s.handleAccountPatch)
@@ -296,8 +297,13 @@ func (s *Server) buildAccount(req accountReq) (*store.Account, mailclient.Creden
 	}, cred, nil
 }
 
+// errAccountExists 批量导入的"已存在"哨兵：计入 skipped 而非 failed（迁移语义：不覆盖）。
+var errAccountExists = errors.New("该邮箱已存在")
+
 // handleAccountBatchImport 批量导入：JSON 数组或 text/plain（main.py ----格式）。
 // 只入库（pending），后台错峰验证（DESIGN.md 2.2、6.2）。
+// JSON 模式接受与导出（GET /accounts/export）同构的迁移格式：名称/文件夹/轮询/提醒/标签等
+// 一并还原；已存在的邮箱跳过不覆盖（skipped 计数）。
 func (s *Server) handleAccountBatchImport(w http.ResponseWriter, r *http.Request) {
 	type failed struct {
 		Line  int    `json:"line"`
@@ -305,8 +311,9 @@ func (s *Server) handleAccountBatchImport(w http.ResponseWriter, r *http.Request
 	}
 	result := struct {
 		Created int      `json:"created"`
+		Skipped int      `json:"skipped"`
 		Failed  []failed `json:"failed"`
-	}{}
+	}{Failed: []failed{}}
 
 	importOne := func(req accountReq, line int) error {
 		acct, _, err := s.buildAccount(req)
@@ -314,10 +321,29 @@ func (s *Server) handleAccountBatchImport(w http.ResponseWriter, r *http.Request
 			return err
 		}
 		if _, err := s.store.GetAccountByEmail(acct.Email); err == nil {
-			return errors.New("该邮箱已存在")
+			return errAccountExists
 		}
-		_, err = s.store.CreateAccount(acct)
-		return err
+		id, err := s.store.CreateAccount(acct)
+		if err != nil {
+			return err
+		}
+		if len(req.Tags) > 0 {
+			if err := s.store.SetAccountTags(id, req.Tags); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	importLine := func(req accountReq, line int) {
+		if err := importOne(req, line); err != nil {
+			if errors.Is(err, errAccountExists) {
+				result.Skipped++
+				return
+			}
+			result.Failed = append(result.Failed, failed{Line: line, Error: err.Error()})
+			return
+		}
+		result.Created++
 	}
 
 	ct := r.Header.Get("Content-Type")
@@ -335,13 +361,9 @@ func (s *Server) handleAccountBatchImport(w http.ResponseWriter, r *http.Request
 				result.Failed = append(result.Failed, failed{Line: i + 1, Error: err.Error()})
 				continue
 			}
-			if err := importOne(req, i+1); err != nil {
-				result.Failed = append(result.Failed, failed{Line: i + 1, Error: err.Error()})
-				continue
-			}
-			result.Created++
+			importLine(req, i+1)
 		}
-	default: // JSON
+	default: // JSON（含 GET /accounts/export 的迁移格式，直接 POST 回本端点即闭环）
 		var reqs []accountReq
 		if err := json.NewDecoder(io.LimitReader(r.Body, 32<<20)).Decode(&reqs); err != nil {
 			writeErr(w, http.StatusBadRequest, "bad_request",
@@ -349,11 +371,7 @@ func (s *Server) handleAccountBatchImport(w http.ResponseWriter, r *http.Request
 			return
 		}
 		for i, req := range reqs {
-			if err := importOne(req, i+1); err != nil {
-				result.Failed = append(result.Failed, failed{Line: i + 1, Error: err.Error()})
-				continue
-			}
-			result.Created++
+			importLine(req, i+1)
 		}
 	}
 
@@ -362,6 +380,66 @@ func (s *Server) handleAccountBatchImport(w http.ResponseWriter, r *http.Request
 		s.manager.ReloadBatch()
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// handleAccountExport 导出账号（迁移用）：accountReq 同构的裸 JSON 数组，
+// 可直接 POST /accounts/batch 导回（闭环迁移）。
+//   - 默认仅配置（不含凭据），用于备份/审查；
+//   - include_credentials=true 时附解密凭据（oauth2 → refresh_token；password → password），
+//     这是"API 永不回显凭据"原则的**显式例外**（迁移必须迁移凭据），文件为明文，责任在调用方；
+//   - q/status/tag 筛选与列表一致（可只导某个标签的账号）。
+func (s *Server) handleAccountExport(w http.ResponseWriter, r *http.Request) {
+	includeCred := r.URL.Query().Get("include_credentials") == "true"
+
+	var accts []*store.Account
+	for page := 1; ; page++ {
+		list, total, err := s.store.ListAccounts(store.AccountFilter{
+			Q: r.URL.Query().Get("q"), Status: r.URL.Query().Get("status"),
+			Tags: r.URL.Query()["tag"], Page: page, Limit: 500,
+		})
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "export_failed", err.Error())
+			return
+		}
+		accts = append(accts, list...)
+		if len(list) == 0 || len(accts) >= total {
+			break
+		}
+	}
+
+	ids := make([]int64, 0, len(accts))
+	for _, a := range accts {
+		ids = append(ids, a.ID)
+	}
+	tags := s.tagsFor(ids)
+
+	out := make([]accountReq, 0, len(accts))
+	for _, a := range accts {
+		req := accountReq{
+			Name: a.Name, Email: a.Email, IMAPHost: a.IMAPHost, IMAPPort: a.IMAPPort,
+			Username: a.Username, AuthType: a.AuthType, ClientID: a.ClientID,
+			Transport: a.Transport, PollInterval: a.PollInterval,
+			NotifyEnabled: a.NotifyEnabled, Tags: tags[a.ID],
+		}
+		if len(req.Tags) == 0 {
+			req.Tags = []string{}
+		}
+		_ = json.Unmarshal([]byte(a.Folders), &req.Folders)
+		if includeCred {
+			if plain, err := s.cipher.Decrypt(a.CredentialEnc); err == nil {
+				switch a.AuthType {
+				case "oauth2":
+					req.RefreshToken = string(plain)
+				case "password":
+					req.Password = string(plain)
+				}
+			}
+		}
+		out = append(out, req)
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="mailhub-accounts.json"`)
+	slog.Info("accounts exported", "count", len(out), "include_credentials", includeCred) // 只记数量与开关
+	writeJSON(w, http.StatusOK, out)
 }
 
 // parseAccountLine 解析 main.py 的账号行：邮箱----密码----client_id----refresh_token。

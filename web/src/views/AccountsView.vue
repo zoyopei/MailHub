@@ -4,10 +4,10 @@ import { computed, h, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   NButton, NCard, NInput, NInputNumber, NSelect, NSpace, NSwitch, NTag, NDataTable,
   NPagination, NModal, NForm, NFormItem, NRadioGroup, NRadio, NText, NDynamicTags,
-  NAlert, useMessage, useDialog,
+  NAlert, NCheckbox, useMessage, useDialog,
   type DataTableColumns,
 } from 'naive-ui'
-import { relTime, request, postText } from '../api'
+import { download, relTime, request, postText } from '../api'
 import type { Account } from '../types'
 
 const message = useMessage()
@@ -304,11 +304,11 @@ const columns = computed<DataTableColumns<Account>>(() => [
   }) },
 ])
 
-// ---- 批量导入 ----
+// ---- 批量导入（text/plain ----格式 或 迁移 JSON 数组）----
 const showImport = ref(false)
 const importText = ref('')
 const importing = ref(false)
-const importResult = ref<{ created: number; failed: { line: number; error: string }[] | null } | null>(null)
+const importResult = ref<{ created: number; skipped?: number; failed: { line: number; error: string }[] | null } | null>(null)
 
 function openImport() {
   showImport.value = true
@@ -322,14 +322,38 @@ function onImportFile(ev: Event) {
   reader.readAsText(f)
 }
 async function submitImport() {
-  if (!importText.value.trim()) return
+  const text = importText.value.trim()
+  if (!text) return
   importing.value = true
   importResult.value = null
   try {
-    importResult.value = await postText('/api/v1/accounts/batch', importText.value) as never
+    // 内容以 [ 开头 → 迁移 JSON 数组（application/json，含设置与凭据）；否则 ----格式文本
+    if (text.startsWith('[')) {
+      importResult.value = await request('POST', '/api/v1/accounts/batch', JSON.parse(text)) as never
+    } else {
+      importResult.value = await postText('/api/v1/accounts/batch', text) as never
+    }
     load()
+    loadTags()
   } catch (e) { message.error((e as Error).message) }
   finally { importing.value = false }
+}
+
+// ---- 导出（迁移）----
+const showExport = ref(false)
+const exportCred = ref(false)
+const exporting = ref(false)
+async function submitExport() {
+  exporting.value = true
+  try {
+    const d = new Date()
+    const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
+    await download(`/api/v1/accounts/export?include_credentials=${exportCred.value}`,
+      `mailhub-accounts-${stamp}.json`)
+    message.success(`已导出${exportCred.value ? '（含凭据，请妥善保管）' : ''}`)
+    showExport.value = false
+  } catch (e) { message.error((e as Error).message) }
+  finally { exporting.value = false }
 }
 
 // ---- 单个添加 ----
@@ -385,6 +409,7 @@ onBeforeUnmount(() => {
         style="width: 220px" @update:value="page = 1; load()" />
       <n-space :size="8" style="margin-left: auto">
         <n-button size="small" type="primary" @click="openImport">批量导入</n-button>
+        <n-button size="small" @click="showExport = true; exportCred = false">导出</n-button>
         <n-button size="small" @click="showAdd = true">添加账号</n-button>
         <n-button size="small" :disabled="checked.size === 0" @click="batchSync">
           收取选中 ({{ checked.size }})
@@ -418,25 +443,26 @@ onBeforeUnmount(() => {
         @update:page="load()" />
     </div>
 
-    <!-- 批量导入对话框 -->
-    <n-modal v-model:show="showImport" preset="card" title="批量导入 Outlook/Hotmail"
-      style="width: 640px">
+    <!-- 批量导入对话框（----格式文本 或 迁移 JSON） -->
+    <n-modal v-model:show="showImport" preset="card" title="批量导入" style="width: 640px">
       <n-space vertical size="medium">
         <n-text depth="3">
-          每行 <code>邮箱----密码----client_id----令牌</code>（与 main.py 账号文件逐字兼容；
-          密码段不使用、不存储；Outlook/Hotmail 域名自动走 Graph 传输）。支持 <code>#</code> 注释与空行。
+          支持 <code>[</code> 开头的<b>迁移 JSON 数组</b>（"导出"生成，含设置与凭据，自动还原名称/文件夹/轮询/提醒/标签），
+          或每行 <code>邮箱----密码----client_id----令牌</code> 的账号文本（与 main.py 账号文件逐字兼容；
+          密码段不使用、不存储；Outlook/Hotmail 域名自动走 Graph 传输，支持 <code>#</code> 注释与空行）。已存在的邮箱跳过不覆盖。
         </n-text>
         <div>
-          <input type="file" accept=".txt" @change="onImportFile" />
+          <input type="file" accept=".txt,.json" @change="onImportFile" />
         </div>
         <n-input v-model:value="importText" type="textarea" :rows="10" mono
-          placeholder="a1@outlook.com----unused----00000000-…----O.XXXX…" />
+          placeholder="粘贴迁移 JSON，或 a1@outlook.com----unused----00000000-…----O.XXXX…" />
         <n-space justify="end">
           <n-button @click="showImport = false">取消</n-button>
           <n-button type="primary" :loading="importing" :disabled="!importText.trim()"
             @click="submitImport">导入</n-button>
         </n-space>
-        <n-card v-if="importResult" size="small" :title="`导入完成：成功 ${importResult.created} 个`">
+        <n-card v-if="importResult" size="small"
+          :title="`导入完成：成功 ${importResult.created} 个${importResult.skipped ? `，跳过 ${importResult.skipped} 个（已存在）` : ''}`">
           <template v-if="importResult.failed?.length">
             <div v-for="f in importResult.failed" :key="f.line" class="fail-line">
               第 {{ f.line }} 行：{{ f.error }}
@@ -444,6 +470,26 @@ onBeforeUnmount(() => {
           </template>
           <n-text v-else depth="3">无失败行</n-text>
         </n-card>
+      </n-space>
+    </n-modal>
+
+    <!-- 导出对话框（迁移） -->
+    <n-modal v-model:show="showExport" preset="card" title="导出账号（迁移）" style="width: 520px">
+      <n-space vertical size="medium">
+        <n-text depth="3">
+          导出全部账号为 JSON（名称/文件夹/轮询间隔/提醒开关/标签一并包含），
+          在目标实例的"批量导入"粘贴该文件即可完成迁移。已存在的邮箱会被跳过，不影响目标实例已有账号。
+        </n-text>
+        <n-checkbox v-model:checked="exportCred">
+          包含凭据（明文）
+        </n-checkbox>
+        <n-text v-if="exportCred" type="warning" size="small">
+          勾选后导出文件含解密后的密码/令牌明文——迁移到新实例必需；文件请妥善保管，迁移完成后建议删除。
+        </n-text>
+        <n-space justify="end">
+          <n-button @click="showExport = false">取消</n-button>
+          <n-button type="primary" :loading="exporting" @click="submitExport">导出</n-button>
+        </n-space>
       </n-space>
     </n-modal>
 

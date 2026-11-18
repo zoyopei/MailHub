@@ -106,10 +106,47 @@ REST API 完整参考（以当前实现为准；架构层面的契约与动机�
 ### `POST /api/v1/accounts/batch`（批量导入）
 Content-Type 二选一：
 
-- `application/json`：`[{"email":"a@outlook.com","refresh_token":"…","client_id":"…"}, …]`
+- `application/json`：`[{"email":"a@outlook.com","refresh_token":"…","client_id":"…"}, …]`；
+  **迁移模式**——直接 POST `GET /accounts/export` 的导出数组，名称/文件夹/轮询间隔/提醒开关/标签等一并还原（凭据字段必填，需用含凭据的导出文件）
 - `text/plain`：与 main.py 账号文件**逐字兼容**，每行 `邮箱----密码----client_id----令牌`（`#` 注释、空行允许；Outlook/Hotmail 自动套用 oauth2 + graph 预设；**密码段不使用、不存储**）
 
-只入库（`pending`），后台错峰验证（DESIGN 2.2）。响应：`{"created": 18, "failed": [{"line": 3, "error": "…"}]}`
+只入库（`pending`），后台错峰验证（DESIGN 2.2）。**已存在的邮箱跳过、不覆盖**（计入 `skipped`）。响应：
+
+```json
+{ "created": 18, "skipped": 2, "failed": [{"line": 3, "error": "…"}] }
+```
+
+### `GET /api/v1/accounts/export`（导出/迁移）
+导出账号为裸 JSON 数组，**格式与批量导入的 JSON 模式同构**——导出文件直接 POST 回 `/accounts/batch` 即完成迁移闭环。
+
+| 参数 | 说明 |
+|---|---|
+| `include_credentials` | `true` 时附**解密后的凭据明文**（oauth2 → `refresh_token`；password → `password`）；默认 `false` 仅导配置 |
+| `q` / `status` / `tag` | 与列表筛选一致（可只导某个标签的账号） |
+
+响应（`Content-Disposition: attachment`）：
+
+```json
+[{
+  "email": "a@outlook.com", "name": "生产-主邮箱", "auth_type": "oauth2",
+  "client_id": "9e5f94bc-…", "refresh_token": "O.XXXX…",
+  "imap_host": "outlook.office365.com", "imap_port": 993, "username": "a@outlook.com",
+  "transport": "graph", "folders": ["INBOX", "JunkEmail"],
+  "poll_interval": 300, "notify_enabled": true, "tags": ["生产"]
+}]
+```
+
+**迁移三步**：
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" "http://old:8080/api/v1/accounts/export?include_credentials=true" -o accounts.json
+# accounts.json 安全传输到新实例主机（scp 等）
+curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data-binary @accounts.json http://new:8080/api/v1/accounts/batch
+```
+
+> ⚠️ `include_credentials=true` 是"API 永不回显凭据"原则的**显式例外**（迁移必须迁移凭据）：
+> 导出文件为明文凭据，传输与保管责任在调用方，迁移完成后建议删除。导出不含已收邮件
+> （邮件数据迁移需自行拷贝 `data/` 目录）。
 
 ### `POST /api/v1/accounts/test`
 测试连接，不入库。请求体同创建。响应：`{"ok": true}` 或 400 带失败原因。
