@@ -79,7 +79,7 @@ jobs:
           uid=$(docker inspect --format '{{.Config.User}}' mailhub:ci)
           echo "镜像 USER=$uid"
           [ "$uid" = "1000" ]
-          run_uid=$(docker top mailhub-ci | awk 'NR==2{print $1}')
+          run_uid=$(docker top mailhub-ci -o uid | tail -1 | tr -d ' ')
           echo "运行 UID=$run_uid"
           [ "$run_uid" = "1000" ]
           docker rm -f mailhub-ci
