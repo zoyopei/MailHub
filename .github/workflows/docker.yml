@@ -16,11 +16,30 @@ env:
   IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/mailhub
 
 jobs:
+  # 前置检查：secrets 不能用于 job 级 if，经此 job 的 output 中转
+  check:
+    name: 检查 Docker Hub 凭据
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.cred.outputs.ok }}
+    steps:
+      - id: cred
+        env:
+          USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$USER" ] && [ -n "$TOKEN" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN Secrets，跳过镜像推送"
+          fi
+
   build-push:
     name: 构建并推送多架构镜像
+    needs: check
+    # 凭据未配置时跳过（不报红），配置后下次 push 生效或手动重跑
+    if: needs.check.outputs.ok == 'true'
     runs-on: ubuntu-latest
-    # secrets 未配置时跳过（不报红），配置后下次 push 生效或手动重跑
-    if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
 
