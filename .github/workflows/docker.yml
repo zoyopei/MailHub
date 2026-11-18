@@ -1,7 +1,11 @@
 # Docker 镜像：构建多架构镜像并推送 Docker Hub
-#   tag v*      → <user>/mailhub:版本号 / 次版本 / latest
-#   push main   → <user>/mailhub:dev
-# 前置：仓库 Secrets 配置 DOCKERHUB_USERNAME 与 DOCKERHUB_TOKEN（未配置时本工作流自动跳过）
+#   tag v*      → <image>:版本号 / 次版本 / latest
+#   push main   → <image>:dev
+# 前置 Secrets（未配置时本工作流自动跳过）：
+#   DOCKERHUB_USERNAME  登录账号（个人账号即可，需对目标仓库有写权限）
+#   DOCKERHUB_TOKEN     Docker Hub → Account Settings → Personal access tokens（Read & Write）
+#   DOCKERHUB_IMAGE     可选，完整镜像名（如 myorg/mailhub 推送到组织命名空间）；
+#                       未配置时回退 <DOCKERHUB_USERNAME>/mailhub
 name: Docker
 
 on:
@@ -13,9 +17,6 @@ on:
 permissions:
   contents: read
 
-env:
-  IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/mailhub
-
 jobs:
   # 前置检查：secrets 不能用于 job 级 if，经此 job 的 output 中转
   check:
@@ -23,16 +24,24 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       ok: ${{ steps.cred.outputs.ok }}
+      image: ${{ steps.cred.outputs.image }}
     steps:
       - id: cred
         env:
           USER: ${{ secrets.DOCKERHUB_USERNAME }}
           TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE: ${{ secrets.DOCKERHUB_IMAGE }}
         run: |
           if [ -n "$USER" ] && [ -n "$TOKEN" ]; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN Secrets，跳过镜像推送"
+          fi
+          # 镜像名：优先 DOCKERHUB_IMAGE（组织命名空间等），回退个人命名空间
+          if [ -n "$IMAGE" ]; then
+            echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=${USER}/mailhub" >> "$GITHUB_OUTPUT"
           fi
 
   build-push:
@@ -54,7 +63,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE }}
+          images: ${{ needs.check.outputs.image }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
