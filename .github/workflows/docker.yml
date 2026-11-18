@@ -24,24 +24,16 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       ok: ${{ steps.cred.outputs.ok }}
-      image: ${{ steps.cred.outputs.image }}
     steps:
       - id: cred
         env:
           USER: ${{ secrets.DOCKERHUB_USERNAME }}
           TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          IMAGE: ${{ secrets.DOCKERHUB_IMAGE }}
         run: |
           if [ -n "$USER" ] && [ -n "$TOKEN" ]; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN Secrets，跳过镜像推送"
-          fi
-          # 镜像名：优先 DOCKERHUB_IMAGE（组织命名空间等），回退个人命名空间
-          if [ -n "$IMAGE" ]; then
-            echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          else
-            echo "image=${USER}/mailhub" >> "$GITHUB_OUTPUT"
           fi
 
   build-push:
@@ -60,10 +52,24 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # 镜像名在本 job 内解析（优先 DOCKERHUB_IMAGE，回退个人命名空间）。
+      # 不经 needs outputs 跨 job 传递：其值含 secret 子串时会被置空。
+      - name: 解析镜像名
+        id: resolve
+        env:
+          USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          IMAGE: ${{ secrets.DOCKERHUB_IMAGE }}
+        run: |
+          if [ -n "$IMAGE" ]; then
+            echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=${USER}/mailhub" >> "$GITHUB_OUTPUT"
+          fi
+
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ needs.check.outputs.image }}
+          images: ${{ steps.resolve.outputs.image }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
