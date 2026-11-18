@@ -1,0 +1,33 @@
+# 敏感文件（真实凭据/密钥，绝不入库）
+accounts.txt
+mailhub.env
+.env
+
+# 运行时数据与本地产物
+bin/
+data/
+data-smoke/
+*.exe
+*.test
+*.out
+*.prof
+
+# 日志（部署脚本产生 server.out.log / server.err.log，与 mailhub-dev skill 一致）
+*.log
+server.err
+
+# 前端：node_modules 与构建产物不入库（占位 index.html 除外，保证无 node 环境也能 go build）
+web/node_modules/
+web/dist/*
+!web/dist/index.html
+
+# Python 前身工具产物（main.py 本身入库）
+__pycache__/
+*.pyc
+
+# 系统与编辑器杂项
+.DS_Store
+Thumbs.db
+
+# 个人环境配置（含内网地址/用户名/密钥路径）
+.vscode/sftp.json

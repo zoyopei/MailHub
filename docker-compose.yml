@@ -1,0 +1,33 @@
+# MailHub 部署（DESIGN.md 9.2）。
+# 凭据经根目录 .env 注入（KEY=value 每行一条，无 export 前缀；勿提交）：
+#   MAILHUB_API_TOKEN=...
+#   MAILHUB_SECRET_KEY=...   # go run ./cmd/mailhub --gen-secret 生成
+services:
+  mailhub:
+    build: .
+    image: mailhub:latest
+    restart: unless-stopped
+    ports: ["18099:18099"]
+    volumes: ["mailhub-data:/data"]
+    ulimits: { nofile: 8192 }        # 千级 IMAP 长连接需要（DESIGN.md 2.2）
+    environment:
+      MAILHUB_DATA_DIR: /data
+      MAILHUB_LISTEN: :18099
+      MAILHUB_API_TOKEN: ${MAILHUB_API_TOKEN:?请在 .env 设置}
+      MAILHUB_SECRET_KEY: ${MAILHUB_SECRET_KEY:?请在 .env 设置}
+      # MAILHUB_RETENTION_DAYS: 90   # 0/省略 = 永久保留
+      # MAILHUB_IDLE_BUDGET_PER_HOST: 50
+
+  # 可选：矩阵规模建议启用 PostgreSQL（DESIGN.md 9.2）
+  # postgres:
+  #   image: postgres:17
+  #   restart: unless-stopped
+  #   volumes: ["pg-data:/var/lib/postgresql/data"]
+  #   environment:
+  #     POSTGRES_DB: mailhub
+  #     POSTGRES_USER: mailhub
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  # 之后给 mailhub 加：MAILHUB_DATABASE_URL: postgres://mailhub:${POSTGRES_PASSWORD}@postgres/mailhub
+
+volumes:
+  mailhub-data:

@@ -1,0 +1,32 @@
+# 敏感文件绝不进构建上下文
+accounts.txt
+mailhub.env
+.env
+
+# 版本控制/编辑器/agent 配置（与构建无关）
+.git
+.gitignore
+.vscode
+.claude
+
+# 运行时数据与本地产物
+data/
+data-smoke/
+bin/
+*.exe
+*.test
+*.out
+*.log
+server.err
+
+# 前端：本地依赖与构建产物由阶段 1 重建（占位 index.html 同理，COPY --from=web 覆盖）
+web/node_modules/
+web/dist/
+
+# 前身工具与临时文件
+main.py
+__pycache__/
+*.pyc
+
+# 文档（镜像不需要）
+*.md
