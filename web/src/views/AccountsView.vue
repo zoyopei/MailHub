@@ -219,40 +219,40 @@ function removeOne(a: Account) {
 }
 
 // ---- 批量操作 ----
-const checked = ref<Set<number>>(new Set())
+// 选中行（Naive UI checked-row-keys 要求 RowKey[]；此前误用 Set 导致勾选无反应）
+const checked = ref<number[]>([])
 function rowKey(r: Account) { return r.id }
-function onCheck(keys: number[]) { checked.value = new Set(keys) }
 
 async function batchPatch(body: Record<string, unknown>, okMsg: string) {
-  if (checked.value.size === 0) return
+  if (checked.value.length === 0) return
   try {
     await request('PATCH', '/api/v1/accounts/batch', { ids: [...checked.value], ...body })
     message.success(okMsg)
-    checked.value = new Set()
+    checked.value = []
     load()
   } catch (e) { message.error((e as Error).message) }
 }
 function batchRemove() {
-  if (checked.value.size === 0) return
+  if (checked.value.length === 0) return
   dialog.warning({
     title: '批量删除账号',
-    content: `确定删除选中的 ${checked.value.size} 个账号及其全部本地邮件？`,
+    content: `确定删除选中的 ${checked.value.length} 个账号及其全部本地邮件？`,
     positiveText: '删除', negativeText: '取消',
     onPositiveClick: async () => {
       for (const id of checked.value) {
         try { await request('DELETE', `/api/v1/accounts/${id}?purge=true`) } catch { /* 逐个尽力删 */ }
       }
       message.success('已删除')
-      checked.value = new Set()
+      checked.value = []
       load()
     },
   })
 }
 async function batchSync() {
-  if (checked.value.size === 0) return
+  if (checked.value.length === 0) return
   try {
     await request('POST', '/api/v1/accounts/sync', { ids: [...checked.value] })
-    message.success(`已排队收取 ${checked.value.size} 个账号（错峰执行）`)
+    message.success(`已排队收取 ${checked.value.length} 个账号（错峰执行）`)
   } catch (e) { message.error((e as Error).message) }
 }
 
@@ -411,31 +411,30 @@ onBeforeUnmount(() => {
         <n-button size="small" type="primary" @click="openImport">批量导入</n-button>
         <n-button size="small" @click="showExport = true; exportCred = false">导出</n-button>
         <n-button size="small" @click="showAdd = true">添加账号</n-button>
-        <n-button size="small" :disabled="checked.size === 0" @click="batchSync">
-          收取选中 ({{ checked.size }})
+        <n-button size="small" :disabled="checked.length === 0" @click="batchSync">
+          收取选中 ({{ checked.length }})
         </n-button>
-        <n-button size="small" :disabled="checked.size === 0" @click="batchPatch({ enabled: true }, '已启用')">
+        <n-button size="small" :disabled="checked.length === 0" @click="batchPatch({ enabled: true }, '已启用')">
           启用
         </n-button>
-        <n-button size="small" :disabled="checked.size === 0" @click="batchPatch({ enabled: false }, '已停用')">
+        <n-button size="small" :disabled="checked.length === 0" @click="batchPatch({ enabled: false }, '已停用')">
           停用
         </n-button>
-        <n-button size="small" :disabled="checked.size === 0" @click="batchPatch({ notify_enabled: true }, '已开启提醒')">
+        <n-button size="small" :disabled="checked.length === 0" @click="batchPatch({ notify_enabled: true }, '已开启提醒')">
           提醒开
         </n-button>
-        <n-button size="small" :disabled="checked.size === 0" @click="batchPatch({ notify_enabled: false }, '已关闭提醒')">
+        <n-button size="small" :disabled="checked.length === 0" @click="batchPatch({ notify_enabled: false }, '已关闭提醒')">
           提醒关
         </n-button>
-        <n-button size="small" type="error" secondary :disabled="checked.size === 0" @click="batchRemove">
+        <n-button size="small" type="error" secondary :disabled="checked.length === 0" @click="batchRemove">
           删除
         </n-button>
       </n-space>
     </div>
 
-    <n-data-table v-model:checked-row-keys="checked" as="checkedRowKeys" :columns="columns" :data="rows"
+    <n-data-table v-model:checked-row-keys="checked" :columns="columns" :data="rows"
       :row-key="rowKey" :loading="loading" :bordered="false" size="small"
-      :max-height="`calc(100vh - 220px)`" :scroll-x="1400"
-      @update:checked-row-keys="(keys: number[]) => onCheck(keys as number[])" />
+      :max-height="`calc(100vh - 220px)`" :scroll-x="1400" />
 
     <div class="pager">
       <n-text depth="3" size="small">共 {{ total }} 个账号</n-text>
