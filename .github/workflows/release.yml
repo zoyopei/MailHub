@@ -46,12 +46,15 @@ jobs:
           - os: ubuntu-latest
             goos: linux
             goarch: amd64
+            bin: mailhub
           - os: ubuntu-latest
             goos: linux
             goarch: arm64
+            bin: mailhub
           - os: windows-latest
             goos: windows
             goarch: amd64
+            bin: mailhub.exe
     env:
       CGO_ENABLED: 0
       GOOS: ${{ matrix.goos }}
@@ -70,7 +73,7 @@ jobs:
           path: web/dist
 
       - name: 构建
-        run: go build -trimpath -ldflags="-s -w" -o build/mailhub ./cmd/mailhub
+        run: go build -trimpath -ldflags="-s -w" -o build/${{ matrix.bin }} ./cmd/mailhub
 
       - name: 打包（Linux/macOS tar.gz）
         if: matrix.goos != 'windows'
@@ -82,7 +85,7 @@ jobs:
         if: matrix.goos == 'windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path build/mailhub.exe -DestinationPath "build/mailhub_${{ github.ref_name }}_windows_amd64.zip"
+          Compress-Archive -Path build/${{ matrix.bin }} -DestinationPath "build/mailhub_${{ github.ref_name }}_windows_amd64.zip"
 
       - uses: actions/upload-artifact@v4
         with:
