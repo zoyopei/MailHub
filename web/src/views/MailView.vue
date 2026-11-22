@@ -65,14 +65,14 @@ function pickTag(t: string) {
 // 时间范围筛选（[起始, 结束] 毫秒时间戳；后端 since/until，DESIGN.md 6.3）
 const timeRange = ref<[number, number] | null>(null)
 
-// ---- 列宽拖拽（发件人/收件人/时间可调；主题列 flex 占余宽）----
+// ---- 列宽拖拽（邮箱/发件人/时间可调；主题列 flex 占余宽）----
 const WKEY = 'mailhub_mail_colw'
-const colW = reactive({ acct: 170, from: 180, to: 200, time: 90 })
+const colW = reactive({ acct: 170, from: 180, time: 90 })
 try { Object.assign(colW, JSON.parse(localStorage.getItem(WKEY) || '{}')) } catch { /* 隐私模式等 */ }
 function saveColW() {
   try { localStorage.setItem(WKEY, JSON.stringify(colW)) } catch { /* 忽略 */ }
 }
-function startResize(key: 'acct' | 'from' | 'to' | 'time', e: MouseEvent) {
+function startResize(key: 'acct' | 'from' | 'time', e: MouseEvent) {
   const startX = e.clientX
   const startW = colW[key]
   const onMove = (ev: MouseEvent) => {
@@ -453,7 +453,7 @@ onBeforeUnmount(() => {
           <div v-if="state.msgs.length === 0 && !state.loading" class="empty-wrap">
             <n-empty description="暂无邮件（矩阵低频收件，新邮件到达后自动入库）" />
           </div>
-          <!-- 表头行（邮箱/发件人/收件人/时间列宽可拖拽；邮箱与时间列头点击排序） -->
+          <!-- 表头行（邮箱/发件人/时间列宽可拖拽；邮箱与时间列头点击排序） -->
           <div v-if="state.msgs.length" class="msg-row msg-head">
             <input type="checkbox" :checked="allChecked" @change="toggleAll" />
             <span class="col-cell sortable" :style="{ width: colW.acct + 'px' }"
@@ -462,8 +462,6 @@ onBeforeUnmount(() => {
                 @click.stop @mousedown="startResize('acct', $event)" /></span>
             <span class="col-cell" :style="{ width: colW.from + 'px' }">发件人
               <span class="resize-h" title="拖拽调整列宽" @mousedown="startResize('from', $event)" /></span>
-            <span class="col-cell" :style="{ width: colW.to + 'px' }">收件人
-              <span class="resize-h" title="拖拽调整列宽" @mousedown="startResize('to', $event)" /></span>
             <span class="col-cell sortable" :style="{ width: colW.time + 'px' }"
               title="按时间排序" @click="toggleSort('time')">时间{{ sortArrow('time') }}
               <span class="resize-h" title="拖拽调整列宽"
@@ -487,8 +485,6 @@ onBeforeUnmount(() => {
                   class="tag-chip" @click.stop="pickTag(t)">{{ t }}</n-tag>
               </div>
             </div>
-            <div class="col-cell msg-to" :style="{ width: colW.to + 'px' }"
-              :title="m.to?.join(', ')">{{ m.to?.length ? m.to.join(', ') : '—' }}</div>
             <div class="col-cell msg-time" :style="{ width: colW.time + 'px' }"
               :title="new Date(m.received_at).toLocaleString()">{{ relTime(m.received_at) }}</div>
             <span class="msg-subject">
@@ -618,7 +614,6 @@ onBeforeUnmount(() => {
   flex-shrink: 0; position: relative; overflow: hidden;
   font-size: 13px; white-space: nowrap; text-overflow: ellipsis;
 }
-.msg-to { color: #666; align-self: baseline; }
 .msg-acct { color: #666; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sortable { cursor: pointer; user-select: none; }
 .sortable:hover { color: #18a058; }
