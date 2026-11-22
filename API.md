@@ -214,6 +214,7 @@ body `{"ids": [...], "enabled": false}` 或 `{"ids": [...], "notify_enabled": tr
 | `limit` | 默认 50 |
 | **默认分页** | `before_id=<id>`（向前翻页，id 倒序）/ `after_id=<id>`（增量，升序） |
 | **排序分页** | `sort=time\|account` + `order=asc\|desc` + `offset=<n>`；`time` 按 `received_at`，`account` 按账号名称（组内时间倒序）；两套分页互斥 |
+| `no_total` | 传 `1` 时跳过 `COUNT(*)` 统计且响应不含 `total`（翻页时可避免重复全表扫描） |
 
 响应（每项含所属账号标签快照；`total` 为**同筛选条件**的邮件总数——前端据此显示"已加载 X / 共 Y"并精确判断是否还有下一页，不受 limit/游标影响）：
 
@@ -346,8 +347,15 @@ X-MailHub-Signature: sha256=<hex(HMAC_SHA256(secret, timestamp + "." + body))>
 
 ## 6. SSE 事件流
 
-### `GET /api/v1/events?token=…`
-`text/event-stream` 长连接；断线 5s 自动重连，30s 心跳保活。
+### `POST /api/v1/events/ticket`
+需 `Authorization: Bearer` 认证。签发一枚 60 秒有效的一次性 SSE 建连票据（消费即销毁），避免主 `MAILHUB_API_TOKEN` 出现在 URL 与代理访问日志中。
+
+```json
+{ "ticket": "<random>", "expires_in": 60 }
+```
+
+### `GET /api/v1/events?ticket=…`
+`text/event-stream` 长连接；30s 心跳保活。推荐使用上方签发的一次性 `?ticket=` 建连（同时保留 `?token=<MAILHUB_API_TOKEN>` 兼容旧脚本）。
 
 ```
 event: message.new
@@ -356,4 +364,4 @@ data: {"id":5321,"subject":"您的验证码","from":"noreply@service.com","accou
 
 - 新邮件入库即推送**单封摘要**（供浏览器通知与列表即时刷新）。
 - **历史邮件（首次同步批量）不推**，防通知轰炸。
-- 非 200（如 token 失效）时浏览器 EventSource 停止自动重连。
+- 使用一次性 `?ticket=` 时，断线重连需先重新调用 `POST /api/v1/events/ticket` 换票。

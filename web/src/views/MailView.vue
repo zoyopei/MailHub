@@ -4,7 +4,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
   NInput, NButton, NSpace, NSwitch, NTag, NBadge, NDrawer, NDrawerContent, NEmpty,
-  NSpin, NText, NTooltip, NPopconfirm, NSelect, NDatePicker, useMessage, useDialog,
+  NSpin, NText, NTooltip, NSelect, NDatePicker, useMessage, useDialog,
 } from 'naive-ui'
 import { download, fmtSize, relTime, request, openEvents } from '../api'
 import type { Account, Msg, MsgDetail } from '../types'
@@ -72,7 +72,7 @@ try { Object.assign(colW, JSON.parse(localStorage.getItem(WKEY) || '{}')) } catc
 function saveColW() {
   try { localStorage.setItem(WKEY, JSON.stringify(colW)) } catch { /* 忽略 */ }
 }
-function startResize(key: 'from' | 'to' | 'time', e: MouseEvent) {
+function startResize(key: 'acct' | 'from' | 'to' | 'time', e: MouseEvent) {
   const startX = e.clientX
   const startW = colW[key]
   const onMove = (ev: MouseEvent) => {
@@ -118,10 +118,11 @@ async function loadMessages(reset = true) {
     } else if (!reset && state.msgs.length) {
       p.set('before_id', String(state.msgs[state.msgs.length - 1].id))
     }
-    const resp = await request<{ messages: Msg[]; total: number }>('GET', `/api/v1/messages?${p}`)
+    if (!reset) p.set('no_total', '1') // 翻页跳过重复 COUNT 全表扫描，沿用首页 total
+    const resp = await request<{ messages: Msg[]; total?: number }>('GET', `/api/v1/messages?${p}`)
     state.msgs = reset ? resp.messages : state.msgs.concat(resp.messages)
-    state.total = resp.total
-    state.hasMore = state.msgs.length < resp.total // 精确判断（替代曾经的 length>=50 近似）
+    if (resp.total !== undefined) state.total = resp.total
+    state.hasMore = resp.messages.length > 0 && state.msgs.length < state.total
     if (reset && scrollEl.value) scrollEl.value.scrollTop = 0 // 换筛选回到顶部，避免深处误触发连加载
   } catch (e) { message.error((e as Error).message) }
   finally { state.loading = false; state.loadingMore = false }
@@ -201,6 +202,7 @@ function deleteMessage(m: Msg) {
       try {
         await request('DELETE', `/api/v1/messages/${m.id}`)
         state.msgs = state.msgs.filter(x => x.id !== m.id)
+        if (state.total > 0) state.total--
         selected.value = null
         message.success('已删除')
         loadAccounts()
@@ -285,18 +287,22 @@ async function syncAccount() {
 }
 
 // ---- 详情正文渲染 ----
-// HTML 正文放入 sandbox iframe；默认不加载远程图片（防追踪像素，DESIGN.md 7.2）
+// HTML 正文放入 sandbox iframe；默认不加载远程图片（防追踪像素，DESIGN.md 7.2）。
+// 未允许加载图片时通过 CSP 彻底阻断一切外部网络请求（含无引号 src、srcset、CSS url() 等）。
 const frameDoc = computed(() => {
   const d = selected.value
   if (!d || !d.body_html) return ''
   let html = d.body_html
+  const csp = loadImages.value
+    ? ''
+    : `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:;">`
   if (!loadImages.value) {
-    // 遮蔽所有图片源：src/data-src 全部摘除，恢复时用原始 HTML 重建
-    html = html.replace(/<img\b([^>]*)\bsrc\s*=\s*("([^"]*)"|'([^']*)')/gi, '<img$1')
+    // 摘除图片源并展示占位提示，恢复时用原始 HTML 重建
+    html = html.replace(/<img\b([^>]*)\bsrc\s*=\s*("([^"]*)"|'([^']*)'|[^\s>]+)/gi, '<img$1')
     html = html.replace(/<img\b([^>]*?)\/?>/gi,
       (m) => m.replace(/<img\b/i, '<img alt="[图片已屏蔽]"'))
   }
-  return `<!doctype html><html><head><meta charset="utf-8">
+  return `<!doctype html><html><head><meta charset="utf-8">${csp}
 <style>body{font-family:inherit;margin:8px;color:#333;word-break:break-word}img{max-width:100%}</style>
 </head><body>${html}</body></html>`
 })
@@ -313,7 +319,7 @@ function downloadAtt(attId: number, filename: string) {
 // ---- 生命周期 ----
 // SSE：新邮件到达即时刷新（防抖 500ms 合并连发事件；断线由浏览器自动重连，
 // 15s/30s 定时刷新仍保留作为兜底）
-let es: EventSource | null = null
+let es: { close: () => void } | null = null
 let sseTimer: ReturnType<typeof setTimeout> | undefined
 function onSSEMessage(data: string) {
   showNotify(data)
@@ -431,12 +437,10 @@ onBeforeUnmount(() => {
           <n-button size="small" :disabled="!selectedAccount && checked.size === 0" @click="markAllRead">
             全部标已读
           </n-button>
-          <n-popconfirm v-if="selectedAccount" @positive-click="clearAccount">
-            <template #trigger>
-              <n-button size="small" :disabled="!accountById.get(selectedAccount)?.message_count">清空此账号</n-button>
-            </template>
-            清空该账号全部本地邮件？
-          </n-popconfirm>
+          <n-button v-if="selectedAccount" size="small"
+            :disabled="!accountById.get(selectedAccount)?.message_count" @click="clearAccount">
+            清空此账号
+          </n-button>
           <n-button size="small" type="error" secondary :disabled="checked.size === 0" @click="deleteChecked">
             删除选中 ({{ checked.size }})
           </n-button>
@@ -488,7 +492,7 @@ onBeforeUnmount(() => {
             <div class="col-cell msg-time" :style="{ width: colW.time + 'px' }"
               :title="new Date(m.received_at).toLocaleString()">{{ relTime(m.received_at) }}</div>
             <span class="msg-subject">
-              📎 <template v-if="m.has_attachments"> </template>{{ m.subject || '(无主题)' }}
+              <template v-if="m.has_attachments">📎 </template>{{ m.subject || '(无主题)' }}
               <span class="snippet">{{ m.snippet }}</span>
             </span>
           </div>

@@ -2,6 +2,8 @@ package sync
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,7 +42,11 @@ type worker struct {
 	acct    *store.Account
 	trigger chan struct{} // cap=1：手动收取插入信号，非阻塞发送天然合并（DESIGN.md 3.2）
 	cancel  context.CancelFunc
+	done    chan struct{} // run 退出时关闭（Manager 据此等待旧 worker 真正停止；nil = 测试直构）
 }
+
+// minPollInterval 轮询周期下限：防御库中历史脏数据（0/负数会空转或令 rand.Int64N panic）。
+const minPollInterval = 5 * time.Second
 
 // run 主循环：按传输模式反复建立**会话**——
 //   - IDLE 会话（IMAP 且支持且预算内）：单文件夹长连接，阻塞至断线/停止；
@@ -48,6 +54,12 @@ type worker struct {
 //
 // 认证类错误立即停止（auth_failed），其他错误指数退避后重连（DESIGN.md 3.2）。
 func (w *worker) run(ctx context.Context) {
+	if w.done != nil {
+		defer close(w.done) // 最后执行：forget/cancel 完成后才宣告退出
+	}
+	// 任何原因退出（含 auth_failed）都从 Manager 注销自身：否则 TriggerNow 会把信号
+	// 发给已退出的 worker（无人消费），手动收取无法重新拉起账号。
+	defer w.m.forget(w)
 	defer w.cancel()
 	backoff := 5 * time.Second
 	for {
@@ -75,7 +87,7 @@ func (w *worker) run(ctx context.Context) {
 		}
 
 		// 轮询模式的周期等待（IDLE 会话不会正常返回到这里）
-		interval := time.Duration(w.acct.PollInterval) * time.Second
+		interval := max(time.Duration(w.acct.PollInterval)*time.Second, minPollInterval)
 		jitter := time.Duration(rand.Int64N(int64(interval/4) + 1)) // 1/4 周期抖动防同步风暴
 		select {
 		case <-ctx.Done():
@@ -142,9 +154,13 @@ func (w *worker) idleLoop(ctx context.Context, cl mailclient.MailClient) error {
 	}
 	slog.Info("worker in IDLE mode", "account_id", w.acct.ID, "email", w.acct.Email)
 
-	// 兜底间隔取全局配置（DB 覆盖 > env），每轮 IDLE 循环读取：保存后下一轮兜底即生效。
-	fallback := time.Duration(w.m.settingInt(store.SettingFallbackInterval, w.m.cfg.FallbackInterval)) * time.Second
 	for {
+		w.m.store.SetAccountStatus(w.acct.ID, store.StatusIdle, nil)
+		// 兜底间隔取全局配置（DB 覆盖 > env），每轮 IDLE 循环读取：保存后下一轮兜底即生效。
+		fallback := time.Duration(w.m.settingInt(store.SettingFallbackInterval, w.m.cfg.FallbackInterval)) * time.Second
+		if fallback < 30*time.Second {
+			fallback = 30 * time.Second
+		}
 		idleCtx, stopIdle := context.WithCancel(ctx)
 		type ires struct {
 			notified bool
@@ -243,15 +259,17 @@ func (w *worker) fetchFolder(ctx context.Context, cl mailclient.MailClient, fold
 }
 
 // ingest 单封邮件入库：写 .eml → 事务入库 → 改名定稿（DESIGN.md 3.3）。
-// 文件名用消息坐标：IMAP {uidvalidity}-{uid}.eml；Graph 0-{graph_id哈希}.eml
-// （与 IngestMessage 填充的 UNIQUE 键一致），与事务解耦、天然幂等。
+// 文件名用消息坐标：IMAP {uidvalidity}-{uid}.eml；Graph g-{sha256(graph_id) 前 64 位}.eml
+// （32 位哈希在大邮箱下有可观碰撞概率，碰撞会互相覆盖文件），与事务解耦、天然幂等。
 // historical：首次同步的历史邮件，不生成投递记录（DESIGN 3.4/5.1）。
 func (w *worker) ingest(folder string, key mailclient.MsgKey, seenAt time.Time, raw []byte, historical bool) error {
 	p := mailparse.Parse(raw, w.m.cfg.MaxMessageSize)
 
-	uidv, uid := key.UIDValidity, key.UID
+	uid := key.UID
+	name := fmt.Sprintf("%d-%d", key.UIDValidity, key.UID)
 	if key.GraphID != "" {
-		uidv, uid = 0, store.HashGraphID(key.GraphID)
+		sum := sha256.Sum256([]byte(key.GraphID))
+		name = "g-" + hex.EncodeToString(sum[:8])
 	}
 	// received_at = 邮件真实到达时间：Graph receivedDateTime / IMAP INTERNALDATE（seenAt），
 	// 缺失时退回 Date 头（SentAt）；都为零则 store 兜底当前时间（DESIGN.md §4）。
@@ -259,15 +277,25 @@ func (w *worker) ingest(folder string, key mailclient.MsgKey, seenAt time.Time, 
 	if recvAt.IsZero() {
 		recvAt = p.SentAt
 	}
-	rel := fmt.Sprintf("mails/%d/%s/%d-%d.eml",
-		w.acct.ID, recvAt.UTC().Format("2006-01"), uidv, uid)
+	rel := fmt.Sprintf("mails/%d/%s/%s.eml",
+		w.acct.ID, recvAt.UTC().Format("2006-01"), name)
 	abs := filepath.Join(w.m.cfg.DataDir, filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return err
 	}
-	tmp := abs + ".part"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
+	// 先写临时文件并原子改名定稿，再提交事务：避免事务已提交后崩溃导致 DB 引用缺失的 .eml。
+	// 若目标文件已存在（重复投递或上次遗留），保留现有文件不动。
+	_, statErr := os.Stat(abs)
+	existed := statErr == nil
+	if !existed {
+		tmp := abs + ".part"
+		if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, abs); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("定稿 .eml 失败: %w", err)
+		}
 	}
 
 	nm := &store.NewMessage{
@@ -302,16 +330,13 @@ func (w *worker) ingest(folder string, key mailclient.MsgKey, seenAt time.Time, 
 
 	msgID, err := w.m.store.IngestMessage(nm)
 	if errors.Is(err, store.ErrDuplicate) {
-		os.Remove(tmp) // 已存在：丢弃临时文件，静默跳过
-		return nil
+		return nil // 已存在：静默跳过（不删 abs，现有记录仍引用它）
 	}
 	if err != nil {
-		os.Remove(tmp)
+		if !existed {
+			_ = os.Remove(abs) // 入库失败清理本次新写文件；失败则由 maintain 回收孤儿
+		}
 		return fmt.Errorf("入库 %s/%d: %w", folder, uid, err)
-	}
-	if err := os.Rename(tmp, abs); err != nil {
-		// 事务已提交：文件改名失败只记录，邮件数据仍完整于数据库。
-		slog.Error("finalize .eml failed", "account_id", w.acct.ID, "message_id", msgID, "error", err)
 	}
 	if w.m.notifier != nil {
 		w.m.notifier.Wake()

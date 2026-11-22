@@ -32,8 +32,9 @@ type Server struct {
 	dial    func(*store.Account) mailclient.MailClient // 验证连接用（与 worker 同一构造，按 transport 分流）
 	tester  WebhookTester                              // webhook 测试事件（notify.Deliverer；nil = 投递器未启用）
 	wake    func()                                     // 手动重发后唤醒投递器（nil 安全）
-	hub     *Hub                                       // SSE 事件中心（新邮件 → 浏览器即时刷新，M4）
-	reauth  *mstoken.TokenCache                        // "重新获取令牌"（ROPC 密码换新 refresh_token，M4）；独立实例，测试可覆盖 Endpoint
+	hub       *Hub                // SSE 事件中心（新邮件 → 浏览器即时刷新，M4）
+	reauth    *mstoken.TokenCache // "重新获取令牌"（授权码换新 refresh_token，M4）；独立实例，测试可覆盖 Endpoint
+	diskCache diskSizeCache       // /status 磁盘占用 30s 缓存
 }
 
 func NewServer(cfg *config.Config, st *store.Store, c *crypto.Cipher,
@@ -66,6 +67,12 @@ func (s *Server) Handler() http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 	r.Use(s.logger)
+	r.Use(func(next http.Handler) http.Handler { // 附件/原始邮件按声明类型处理，禁止浏览器嗅探
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			next.ServeHTTP(w, r)
+		})
+	})
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -78,8 +85,9 @@ func (s *Server) Handler() http.Handler {
 		s.mountWebhooks(r)
 		s.mountSettings(r)
 		r.Get("/status", s.handleStatus)
+		r.Post("/events/ticket", s.handleEventTicket)
 	})
-	// SSE：EventSource 无法带 Authorization 头，走 ?token= 单独认证（events.go）
+	// SSE：EventSource 无法带 Authorization 头，走 ?ticket=（一次性短票）或 ?token= 单独认证（events.go）
 	r.Get("/api/v1/events", s.handleEvents)
 
 	// Web UI（M3，DESIGN.md 7）：内嵌静态文件，API 未命中即回落到前端。

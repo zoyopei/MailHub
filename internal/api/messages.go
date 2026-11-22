@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -92,8 +93,9 @@ func (s *Server) handleMessageList(w http.ResponseWriter, r *http.Request) {
 	case "time", "account":
 		f.Sort = r.URL.Query().Get("sort")
 	}
-	if r.URL.Query().Get("order") == "asc" {
-		f.Order = "asc"
+	switch r.URL.Query().Get("order") {
+	case "asc", "desc":
+		f.Order = r.URL.Query().Get("order")
 	}
 	if o := queryInt(r, "offset", 0); o > 0 {
 		f.Offset = o
@@ -121,9 +123,14 @@ func (s *Server) handleMessageList(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, resp)
 	}
-	// total：同筛选条件的总数（前端"已加载 X / 共 Y"与 hasMore 精确判断；不含游标/OFFSET）
-	total, _ := s.store.CountMessages(f)
-	writeJSON(w, http.StatusOK, map[string]any{"messages": out, "total": total})
+	// total：同筛选条件的总数（前端"已加载 X / 共 Y"与 hasMore 精确判断；不含游标/OFFSET）。
+	// 翻页时前端传 no_total=1 可跳过重复的 COUNT 全表扫描。
+	resp := map[string]any{"messages": out}
+	if r.URL.Query().Get("no_total") != "1" {
+		total, _ := s.store.CountMessages(f)
+		resp["total"] = total
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleMessageGet 详情：含 body_text/body_html 与附件列表（DESIGN.md 6.3）。
@@ -272,7 +279,7 @@ func (s *Server) handleMessageRaw(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 	w.Header().Set("Content-Type", "message/rfc822")
-	w.Header().Set("Content-Disposition", `attachment; filename="`+sanitizeFilename(m.RawPath)+`"`)
+	w.Header().Set("Content-Disposition", contentDisposition(m.RawPath))
 	io.Copy(w, f)
 }
 
@@ -320,28 +327,68 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 		filename = "attachment"
 	}
 	w.Header().Set("Content-Type", ctype)
-	w.Header().Set("Content-Disposition", `attachment; filename="`+sanitizeFilename(filename)+`"`)
+	w.Header().Set("Content-Disposition", contentDisposition(filename))
 	w.Write(content)
 }
 
 func sanitizeFilename(p string) string {
 	base := filepath.Base(filepath.FromSlash(p))
-	return strings.Map(func(r rune) rune {
+	clean := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1 // 剔除控制字符（含 CR/LF，防响应头注入）
+		}
 		switch r {
-		case '"', '\\', '/', ':', '*', '?', '<', '>', '|':
+		case '"', '\\', '/', ':', '*', '?', '<', '>', '|', ';':
 			return '_'
 		}
 		return r
 	}, base)
+	clean = strings.TrimSpace(clean)
+	if clean == "" || clean == "." || clean == ".." {
+		return "attachment"
+	}
+	return clean
 }
 
-// removeFiles 按相对路径删除磁盘文件（容忍缺失）。
-func removeFiles(dataDir string, relPaths []string) {
-	for _, rel := range relPaths {
-		abs := filepath.Join(dataDir, filepath.FromSlash(rel))
-		if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
-			continue // 孤儿文件由 M3 清理任务回收
+// contentDisposition 生成兼容中文文件名的 Content-Disposition（RFC 6266 / RFC 5987）：
+// 纯 ASCII 只输出 filename="..."；含非 ASCII 时附带 filename*=UTF-8''...。
+func contentDisposition(name string) string {
+	clean := sanitizeFilename(name)
+	hasNonASCII := false
+	ascii := strings.Map(func(r rune) rune {
+		if r > 0x7e {
+			hasNonASCII = true
+			return '_'
+		}
+		return r
+	}, clean)
+	if !hasNonASCII {
+		return `attachment; filename="` + ascii + `"`
+	}
+	if strings.Trim(ascii, "_.") == "" {
+		ascii = "attachment"
+	}
+	return `attachment; filename="` + ascii + `"; filename*=UTF-8''` + rfc5987Encode(clean)
+}
+
+// rfc5987Encode 按 RFC 5987 §3.2.1 attr-char 编码 UTF-8 字符串。
+func rfc5987Encode(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			strings.IndexByte("!#$&+-.^_`|~", c) >= 0 {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
 		}
 	}
-	_ = mailparse.Parse
+	return b.String()
+}
+
+// removeFiles 按相对路径删除磁盘文件（容忍缺失；失败的孤儿文件由 maintain 清理任务回收）。
+func removeFiles(dataDir string, relPaths []string) {
+	for _, rel := range relPaths {
+		_ = os.Remove(filepath.Join(dataDir, filepath.FromSlash(rel)))
+	}
 }

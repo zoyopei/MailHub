@@ -99,7 +99,11 @@ func (c *Client) FetchFolder(ctx context.Context, folder string, cursor *store.F
 		if err == nil {
 			return res, nil
 		}
-		// deltaLink 失效（410 Gone 等）：退回时间窗列表并重建 delta。
+		// 仅 deltaLink 失效（410 Gone / 404 / 400）才退回时间窗列表重建 delta；
+		// 401（ErrReauth）、429、ctx 取消、网络或入库错误直接上抛，避免重复打 API 或掩盖错误。
+		if !isDeltaInvalid(err) {
+			return res, err
+		}
 		from := since
 		if cursor.LastSeenAt.Valid && cursor.LastSeenAt.Time.After(from) {
 			from = cursor.LastSeenAt.Time
@@ -266,9 +270,26 @@ func (c *Client) get(ctx context.Context, u, accept string) (io.ReadCloser, erro
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("Graph API HTTP %d", resp.StatusCode)
+		return nil, &httpStatusError{code: resp.StatusCode}
 	}
 	return resp.Body, nil
+}
+
+// httpStatusError 保留非 200 状态码，供上层区分 deltaLink 失效（410/404/400）与临时故障。
+type httpStatusError struct {
+	code int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("Graph API HTTP %d", e.code)
+}
+
+func isDeltaInvalid(err error) bool {
+	var se *httpStatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.code == http.StatusGone || se.code == http.StatusNotFound || se.code == http.StatusBadRequest
 }
 
 // SupportsIdle/Idle：Graph 为 HTTP 轮询模型，无长连接推送（DESIGN.md 3.6）。

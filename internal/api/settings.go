@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -73,7 +74,7 @@ func settingSpecByKey(key string) (store.SettingSpec, bool) {
 
 func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	var body map[string]*int // nil = 清除覆盖
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) == 0 {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil || len(body) == 0 {
 		writeErr(w, http.StatusBadRequest, "bad_request", "请求体须为非空 JSON 对象")
 		return
 	}

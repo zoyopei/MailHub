@@ -200,7 +200,7 @@ main.py（Python）的价值以**参数与流程**形式移植：token 刷新只
 
 **增量策略（M2 起 delta 优先）**：`folder_states.delta_link` 持久化 Graph 的 delta 游标。有 delta_link → 直接 `GET {delta_link}`（`@odata.nextLink` 分页滚动至 `@odata.deltaLink`），响应只含上次之后的变更，窗口极窄；无 delta_link（首次/失效）→ `$filter=receivedDateTime ge {游标}` 时间窗列表，完整拉取后以 `delta?$deltatoken=latest` 引导出初始 delta_link。delta_link 失效（410 Gone）自动退回时间窗路径并重建 delta，`last_seen_at` 持续作为兜底游标（取本批最大 `receivedDateTime`，只前进不后退）。两路共用去重与幂等：每页先批量查询已入库的 `graph_id`，只对未见过的消息拉取 `$value`，`(account_id, graph_id)` 唯一索引兜底（边界秒与 delta 重放重拉均不重复入库）；`@removed` 条目（无 `receivedDateTime`）自然跳过——本服务只收不删，远端删除不回写。一个文件夹**完整**拉取成功后才推进游标，中途失败不推进。首次同步与 IMAP 同规：只拉最近 `initial_sync_days` 天。
 
-**消息坐标**：Graph 消息无 UIDVALIDITY/UID，唯一坐标是 `graph_id`（messages 表列，`UNIQUE(account_id, graph_id)`）；IMAP 唯一键的 uid 位由 graph_id 哈希填充以保持两路统一，`.eml` 文件名用 `0-{哈希}.eml`。
+**消息坐标**：Graph 消息无 UIDVALIDITY/UID，唯一坐标是 `graph_id`（messages 表列，`UNIQUE(account_id, graph_id)`）；IMAP 唯一键的 uid 位由 graph_id 哈希填充以保持两路统一（32 位哈希碰撞时入库事务内线性探测下一个空闲 uid），`.eml` 文件名用 `g-{sha256(graph_id) 前 16 位十六进制}.eml`（早期版本为 `0-{哈希}.eml`，以 `raw_path` 为准）。
 
 **降级与一致性**：Graph API 返回 401 映射 `auth_failed`（令牌失效），429 与 5xx 走常规指数退避；`invalid_scope` 提示需在 Azure 应用注册补权限。worker 按 `accounts.transport` 分流（`imap` | `graph`），两条路径共用同一状态机、入库事务与心跳语义。
 

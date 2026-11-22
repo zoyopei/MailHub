@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	gosync "sync"
 	"syscall"
 	"time"
 
@@ -86,15 +87,26 @@ func run() error {
 	// M4：SSE hub 走事件通道（带邮件摘要载荷，浏览器通知），不再作为 Wake 信号成员。
 	manager := sync.NewManager(cfg, st, cipher, dial, deliverer)
 	manager.SetEventNotifier(hub)
+
+	// 后台任务统一纳入 WaitGroup：停机时先等它们退出，再由 defer 关闭 store，
+	// 避免 worker/投递器在 DB 关闭后仍写库。
+	var bg gosync.WaitGroup
+	bg.Add(3)
 	go func() {
+		defer bg.Done()
 		if err := manager.Run(ctx); err != nil {
 			slog.Error("sync manager exited", "error", err)
 		}
 	}()
-	go deliverer.Run(ctx)
-
+	go func() {
+		defer bg.Done()
+		deliverer.Run(ctx)
+	}()
 	// 每日维护：retention 清理 + 孤儿 .eml 回收（DESIGN.md 9.1，TECH.md §4）。
-	go maintain.Run(ctx, cfg, st)
+	go func() {
+		defer bg.Done()
+		maintain.Run(ctx, cfg, st)
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -108,18 +120,28 @@ func run() error {
 		errCh <- srv.ListenAndServe()
 	}()
 
+	var runErr error
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {
-			return err
+			runErr = err
 		}
 	case <-ctx.Done():
 		slog.Info("shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx) // ctx 取消同时停掉全部 worker（Manager.Run 内处理）
+		_ = srv.Shutdown(shutdownCtx)
 	}
-	return nil
+
+	stop() // 监听失败路径也要停掉后台任务
+	done := make(chan struct{})
+	go func() { bg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		slog.Warn("后台任务未在 30s 内退出，强制关闭")
+	}
+	return runErr
 }
 
 func dbKind(cfg *config.Config) string {

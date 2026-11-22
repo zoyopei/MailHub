@@ -75,6 +75,9 @@ func Load() (*Config, error) {
 	if c.WebhookConcurrency < 1 {
 		c.WebhookConcurrency = 1
 	}
+	if c.ConnectStagger < 0 {
+		return nil, errors.New("MAILHUB_CONNECT_STAGGER 不能为负")
+	}
 	return c, nil
 }
 

@@ -39,13 +39,15 @@ type cachedToken struct {
 
 // TokenCache 进程级 access_token 缓存（TECH.md §2.4）：
 // 常驻服务不得像 main.py（短命进程）那样每次连接都刷新——轮询短连接重连直接
-// 复用未过期令牌，过期前 60 秒才再刷新；同一账号的刷新在锁内串行（DESIGN.md 3.5）。
+// 复用未过期令牌，过期前 60 秒才再刷新；按账号 key 粒度加锁（DESIGN.md 3.5），
+// 避免单个账号刷新缓慢时阻塞全进程其他账号的缓存读取或并发刷新。
 type TokenCache struct {
 	HTTP     *http.Client
 	Endpoint string
 
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	cache map[string]cachedToken // key: scope + "\x00" + email + "\x00" + clientID
+	locks map[string]*sync.Mutex // 按 key 串行刷新，不持全局锁做 HTTP I/O
 }
 
 func NewTokenCache() *TokenCache {
@@ -53,19 +55,49 @@ func NewTokenCache() *TokenCache {
 		HTTP:     &http.Client{Timeout: 30 * time.Second},
 		Endpoint: MSTokenEndpoint,
 		cache:    map[string]cachedToken{},
+		locks:    map[string]*sync.Mutex{},
 	}
+}
+
+func (t *TokenCache) keyLock(key string) *sync.Mutex {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.locks == nil {
+		t.locks = map[string]*sync.Mutex{}
+	}
+	l, ok := t.locks[key]
+	if !ok {
+		l = &sync.Mutex{}
+		t.locks[key] = l
+	}
+	return l
 }
 
 // Token 用 refresh_token 换取 scope 对应的 access_token；若服务端轮换了 refresh_token
 // 则同时返回（调用方须立即持久化，DESIGN.md 3.5）。rotated 为空表示未轮换。
 func (t *TokenCache) Token(ctx context.Context, scope, email, clientID, refreshToken string) (access, rotated string, err error) {
 	key := scope + "\x00" + email + "\x00" + clientID
-	t.mu.Lock()
-	defer t.mu.Unlock()
 
+	// 快路径：读锁命中直接返回，不受其他账号刷新阻塞。
+	t.mu.RLock()
 	if c, ok := t.cache[key]; ok && c.refresh == refreshToken && time.Until(c.exp) > time.Minute {
+		t.mu.RUnlock()
 		return c.access, "", nil
 	}
+	t.mu.RUnlock()
+
+	// 慢路径：仅按 key 串行刷新，全局锁不跨 HTTP I/O。
+	kl := t.keyLock(key)
+	kl.Lock()
+	defer kl.Unlock()
+
+	// 双重检查：等待 key 锁期间可能已被并发协程刷新。
+	t.mu.RLock()
+	if c, ok := t.cache[key]; ok && c.refresh == refreshToken && time.Until(c.exp) > time.Minute {
+		t.mu.RUnlock()
+		return c.access, "", nil
+	}
+	t.mu.RUnlock()
 
 	form := url.Values{
 		"client_id":     {clientID},
@@ -117,7 +149,9 @@ func (t *TokenCache) Token(ctx context.Context, scope, email, clientID, refreshT
 	if newRefresh == "" {
 		newRefresh = refreshToken // 端点未轮换时保留原令牌
 	}
+	t.mu.Lock()
 	t.cache[key] = cachedToken{access: tr.AccessToken, refresh: newRefresh, exp: exp}
+	t.mu.Unlock()
 
 	if tr.RefreshToken != "" && tr.RefreshToken != refreshToken {
 		return tr.AccessToken, tr.RefreshToken, nil

@@ -201,6 +201,7 @@ func (s *Server) handleAccountCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "create_failed", err.Error())
 		return
 	}
+	acct.ID = id
 	if len(req.Tags) > 0 {
 		if err := s.store.SetAccountTags(id, req.Tags); err != nil {
 			writeErr(w, http.StatusInternalServerError, "set_tags_failed", err.Error())
@@ -240,6 +241,9 @@ func (s *Server) buildAccount(req accountReq) (*store.Account, mailclient.Creden
 	}
 	if req.IMAPPort == 0 {
 		req.IMAPPort = 993
+	}
+	if req.IMAPPort < 1 || req.IMAPPort > 65535 {
+		return nil, mailclient.Credentials{}, errors.New("imap_port 应在 1-65535 之间")
 	}
 	if req.AuthType == "" {
 		req.AuthType = "password"
@@ -288,6 +292,9 @@ func (s *Server) buildAccount(req accountReq) (*store.Account, mailclient.Creden
 		// 新账号默认轮询间隔：全局配置可覆盖（DB > env，创建账号时读取，DESIGN.md 9.1）
 		poll = s.settingInt(store.SettingPollDefault, s.cfg.PollIntervalDefault)
 	}
+	if poll < minPollInterval {
+		return nil, cred, errPollInterval
+	}
 	return &store.Account{
 		Name: name, Email: req.Email, IMAPHost: req.IMAPHost, IMAPPort: req.IMAPPort,
 		UseTLS: true, Username: req.Username, AuthType: req.AuthType, ClientID: req.ClientID,
@@ -299,6 +306,12 @@ func (s *Server) buildAccount(req accountReq) (*store.Account, mailclient.Creden
 
 // errAccountExists 批量导入的"已存在"哨兵：计入 skipped 而非 failed（迁移语义：不覆盖）。
 var errAccountExists = errors.New("该邮箱已存在")
+
+// minPollInterval 账号轮询周期下限（秒），与 MAILHUB_POLL_INTERVAL_DEFAULT 的校验一致；
+// 0/负数会让 worker 空转或 panic，必须在入口拦截。
+const minPollInterval = 5
+
+var errPollInterval = errors.New("poll_interval 不能小于 5 秒")
 
 // handleAccountBatchImport 批量导入：JSON 数组或 text/plain（main.py ----格式）。
 // 只入库（pending），后台错峰验证（DESIGN.md 2.2、6.2）。
@@ -543,6 +556,10 @@ func (s *Server) handleAccountPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法 JSON")
 		return
 	}
+	if body.PollInterval != nil && *body.PollInterval < minPollInterval {
+		writeErr(w, http.StatusBadRequest, "invalid_account", errPollInterval.Error())
+		return
+	}
 
 	p := store.AccountPatch{
 		Name: body.Name, IMAPHost: body.IMAPHost, Username: body.Username,
@@ -698,9 +715,11 @@ func (s *Server) handleAccountBatchPatch(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusBadRequest, "bad_request", "需要 ids 与 enabled/notify_enabled")
 		return
 	}
+	updated := 0
 	for _, id := range body.IDs {
 		p := store.AccountPatch{Enabled: body.Enabled, NotifyEnabled: body.NotifyEnabled}
 		if err := s.store.ApplyAccountPatch(id, p); err == nil {
+			updated++
 			if body.Enabled != nil {
 				if *body.Enabled {
 					s.manager.ReloadAccount(id)
@@ -710,7 +729,7 @@ func (s *Server) handleAccountBatchPatch(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"updated": len(body.IDs)})
+	writeJSON(w, http.StatusOK, map[string]any{"updated": updated})
 }
 
 // handleAccountDelete 删除账号；purge=true 时先取 raw_path 再删行，最后清磁盘（DESIGN.md 6.2）。

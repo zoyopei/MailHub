@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // fakeTokenServer 模拟 Microsoft 令牌端点（TECH.md §4）。
@@ -190,6 +191,54 @@ func TestTokenCache429(t *testing.T) {
 	tc.Endpoint = ts.URL
 	_, _, err := tc.Token(context.Background(), GraphScope, "a@x.com", "cid", "RT-x")
 	if err == nil || errors.Is(err, ErrReauth) {
-		t.Fatalf("429 应返回普通错误，得 %v", err)
+		t.Fatalf("429 应返回普通错误（提示补权限），得 %v", err)
+	}
+}
+
+// 账号 A 刷新卡住时，账号 B 必须能并发完成刷新且不受阻塞（全局锁不得跨 HTTP I/O）。
+func TestTokenCacheConcurrentRefresh(t *testing.T) {
+	blockA := make(chan struct{})
+	aStarted := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.Form.Get("refresh_token") == "RT-A" {
+			select {
+			case aStarted <- struct{}{}:
+			default:
+			}
+			<-blockA
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"access_token":"AT-ok","expires_in":3600}`))
+	}))
+	defer ts.Close()
+
+	tc := NewTokenCache()
+	tc.Endpoint = ts.URL
+
+	aDone := make(chan error, 1)
+	go func() {
+		_, _, err := tc.Token(context.Background(), GraphScope, "a@x.com", "cid", "RT-A")
+		aDone <- err
+	}()
+	<-aStarted // 确认 A 已进入 HTTP 请求
+
+	bDone := make(chan error, 1)
+	go func() {
+		_, _, err := tc.Token(context.Background(), GraphScope, "b@x.com", "cid", "RT-B")
+		bDone <- err
+	}()
+	select {
+	case err := <-bDone:
+		if err != nil {
+			t.Fatalf("账号 B 刷新失败: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(blockA)
+		t.Fatal("账号 B 被账号 A 的慢请求阻塞")
+	}
+	close(blockA)
+	if err := <-aDone; err != nil {
+		t.Fatalf("账号 A 刷新失败: %v", err)
 	}
 }

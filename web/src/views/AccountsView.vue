@@ -367,7 +367,8 @@ async function submitAdd() {
   adding.value = true
   try {
     const body: Record<string, unknown> = {
-      email: addForm.value.email, name: addForm.value.name, tags: addForm.value.tags,
+      email: addForm.value.email, name: addForm.value.name,
+      auth_type: addForm.value.auth_type, tags: addForm.value.tags,
     }
     if (addForm.value.imap_host) body.imap_host = addForm.value.imap_host
     if (addForm.value.auth_type === 'password') body.password = addForm.value.password

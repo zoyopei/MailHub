@@ -18,9 +18,13 @@ import (
 	"mailhub/internal/store"
 )
 
-// stalePartAge .part 临时文件的安全年龄：写入流程为 tmp → 事务 → rename，
-// 正常存活秒级；超过该年龄即为事务失败/进程崩溃残留。
+// stalePartAge .part 临时文件的安全年龄：写入流程为 tmp → rename → 事务，
+// 正常存活秒级；超过该年龄即为崩溃残留。
 const stalePartAge = 24 * time.Hour
+
+// orphanEmlGrace 未引用 .eml 的回收宽限期：worker 先定稿 .eml 再提交事务，
+// 若维护恰好在两步之间扫描，跳过刚写入的文件防止误删。
+const orphanEmlGrace = 5 * time.Minute
 
 // Run 阻塞执行每日维护：启动即跑一轮（错开 1 分钟，避免与启动峰值重叠），
 // 此后每 24 小时一轮，直至 ctx 取消。
@@ -101,6 +105,10 @@ func sweepOrphans(_ context.Context, cfg *config.Config, st *store.Store) error 
 		case strings.HasSuffix(name, ".eml"):
 			if _, ok := refs[rel]; ok {
 				return nil // 数据库仍引用
+			}
+			info, serr := d.Info()
+			if serr != nil || now.Sub(info.ModTime()) < orphanEmlGrace {
+				return nil // 刚写入（可能尚未提交事务）：暂不回收
 			}
 		default:
 			return nil // 未知文件：不动（保守）

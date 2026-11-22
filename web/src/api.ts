@@ -85,12 +85,48 @@ export async function download(path: string, filename: string) {
 }
 
 // SSE 事件流：新邮件到达即回调（载荷为邮件摘要 JSON 字符串：id/subject/from/account）。
-// 浏览器断线自动重连，retry 5s；401 时浏览器停止重连。
-// EventSource 无法带 Authorization 头，走 ?token= 查询参数（服务端单独认证）。
-export function openEvents(onMessage: (data: string) => void): EventSource {
-  const es = new EventSource(`/api/v1/events?token=${encodeURIComponent(token)}`)
-  es.addEventListener('message.new', (ev) => { onMessage((ev as MessageEvent).data) })
-  return es
+// 通过 Bearer 鉴权的 POST /api/v1/events/ticket 换取 60s 一次性票据建连，
+// 避免主 API Token 进入 URL / 代理访问日志；断线后延迟 5s 重新换票重连。
+export function openEvents(onMessage: (data: string) => void): { close: () => void } {
+  let closed = false
+  let es: EventSource | null = null
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  const schedule = () => {
+    if (closed || !token) return
+    clearTimeout(timer)
+    timer = setTimeout(connect, 5000)
+  }
+
+  const connect = async () => {
+    if (closed || !token) return
+    try {
+      const { ticket } = await request<{ ticket: string }>('POST', '/api/v1/events/ticket')
+      if (closed) return
+      const cur = new EventSource(`/api/v1/events?ticket=${encodeURIComponent(ticket)}`)
+      es = cur
+      cur.addEventListener('message.new', (ev) => { onMessage((ev as MessageEvent).data) })
+      cur.onerror = () => {
+        // 一次性票据不可复用：主动关闭当前 EventSource 并重新换票重连
+        cur.close()
+        if (es === cur) es = null
+        schedule()
+      }
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) return // 已失效，停止重连
+      schedule()
+    }
+  }
+
+  connect()
+  return {
+    close() {
+      closed = true
+      clearTimeout(timer)
+      es?.close()
+      es = null
+    },
+  }
 }
 
 // 相对时间显示（"3 分钟前"）

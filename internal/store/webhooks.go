@@ -50,7 +50,7 @@ func scanWebhook(row interface{ Scan(...any) error }) (*Webhook, error) {
 // CreateWebhook 插入 webhook；secret 由调用方生成（为空时可自动）。
 func (s *Store) CreateWebhook(w *Webhook) (int64, error) {
 	var accountIDs any
-	if ids := w.AccountIDList(); ids != nil {
+	if ids := w.AccountIDList(); len(ids) > 0 {
 		b, _ := json.Marshal(ids)
 		accountIDs = string(b)
 	}

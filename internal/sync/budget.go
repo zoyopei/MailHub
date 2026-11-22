@@ -17,13 +17,15 @@ func newIdleBudget() *idleBudget {
 
 // Acquire 尝试占用一个名额（limit 为当前生效预算）；成功返回 true
 // （调用方在不再 IDLE 时 Release）。nil 接收者视为不限。
+// 无论 limit 是否 <= 0 均递增计数，保证 Acquire/Release 1:1 配平，
+// 运行时从不限（0）切到有限额时也能准确反映当前活跃连接数。
 func (b *idleBudget) Acquire(host string, limit int) bool {
-	if b == nil || limit <= 0 {
-		return true // 不限：不动计数（Release 同样零开销判断）
+	if b == nil {
+		return true
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.active[host] >= limit {
+	if limit > 0 && b.active[host] >= limit {
 		return false
 	}
 	b.active[host]++

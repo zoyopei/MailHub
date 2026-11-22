@@ -2,27 +2,83 @@
 // 事件模型：新邮件入库（worker.ingest → Manager.events.NotifyEvent）→ Hub 广播
 // "message.new" 事件，载荷为单封邮件摘要（id/subject/from/account，供前端浏览器通知；
 // 历史邮件不推，DESIGN 5.1 防轰炸）。投递器的唤醒仍走 Manager.notifier（Wake 信号）。
-// 认证：EventSource 无法携带 Authorization 头，本端点单独接受 ?token= 查询参数
-// （常量时间比较；query 不进访问日志——logger 只记录 path）。
+// 认证：EventSource 无法携带 Authorization 头；推荐先经 Bearer 鉴权的
+// POST /api/v1/events/ticket 换取 60s 一次性短票，再用 ?ticket= 建连（不暴露主令牌
+// 到反向代理访问日志）；同时保留 ?token= 兼容旧脚本。
 package api
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
 )
 
-// Hub 维护 SSE 订阅者；NotifyEvent 携带载荷广播（经 Manager.SetEventNotifier 注入）。
+const (
+	sseTicketTTL   = 60 * time.Second
+	sseMaxTickets  = 1024
+)
+
+// Hub 维护 SSE 订阅者与一次性连接票据；NotifyEvent 携带载荷广播（经 Manager.SetEventNotifier 注入）。
 type Hub struct {
-	mu   sync.Mutex
-	subs map[chan string]struct{}
+	mu      sync.Mutex
+	subs    map[chan string]struct{}
+	tickets map[string]time.Time // 一次性短票 → 过期时间
 }
 
 // NewHub 构造事件中心。
 func NewHub() *Hub {
-	return &Hub{subs: map[chan string]struct{}{}}
+	return &Hub{
+		subs:    map[chan string]struct{}{},
+		tickets: map[string]time.Time{},
+	}
+}
+
+// IssueTicket 签发一枚短期一次性 SSE 票据（60s 有效，消费即销毁）。
+func (h *Hub) IssueTicket() (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	t := base64.RawURLEncoding.EncodeToString(b)
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for k, exp := range h.tickets {
+		if now.After(exp) {
+			delete(h.tickets, k)
+		}
+	}
+	if len(h.tickets) >= sseMaxTickets {
+		// 极端异常时清理最旧一半，防内存无限增长
+		for k := range h.tickets {
+			delete(h.tickets, k)
+			if len(h.tickets) < sseMaxTickets/2 {
+				break
+			}
+		}
+	}
+	h.tickets[t] = now.Add(sseTicketTTL)
+	return t, nil
+}
+
+// ConsumeTicket 校验并销毁一次性票据。
+func (h *Hub) ConsumeTicket(t string) bool {
+	if t == "" {
+		return false
+	}
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	exp, ok := h.tickets[t]
+	if !ok {
+		return false
+	}
+	delete(h.tickets, t)
+	return !now.After(exp)
 }
 
 // NotifyEvent 向全部订阅者广播一条事件载荷（非阻塞：慢消费者只丢事件不阻塞 worker
@@ -52,11 +108,27 @@ func (h *Hub) unsubscribe(ch chan string) {
 	h.mu.Unlock()
 }
 
-// handleEvents GET /api/v1/events?token=…：text/event-stream 长连接。
+// handleEventTicket POST /api/v1/events/ticket（走 Bearer 认证）：签发 60s 一次性 SSE 票据。
+func (s *Server) handleEventTicket(w http.ResponseWriter, _ *http.Request) {
+	t, err := s.hub.IssueTicket()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "ticket_failed", "生成票据失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ticket": t, "expires_in": int(sseTicketTTL.Seconds())})
+}
+
+// handleEvents GET /api/v1/events?ticket=…（或兼容 ?token=…）：text/event-stream 长连接。
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	// 单独认证（EventSource 无自定义头能力）
-	if subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("token")), []byte(s.cfg.APIToken)) != 1 {
-		writeErr(w, http.StatusUnauthorized, "unauthorized", "缺少或错误的 token")
+	// 优先验证一次性短票；否则兼容旧版 ?token=（常量时间比较）
+	authed := false
+	if ticket := r.URL.Query().Get("ticket"); ticket != "" {
+		authed = s.hub.ConsumeTicket(ticket)
+	} else if tok := r.URL.Query().Get("token"); tok != "" {
+		authed = subtle.ConstantTimeCompare([]byte(tok), []byte(s.cfg.APIToken)) == 1
+	}
+	if !authed {
+		writeErr(w, http.StatusUnauthorized, "unauthorized", "缺少或无效的 ticket / token")
 		return
 	}
 	fl, ok := w.(http.Flusher)

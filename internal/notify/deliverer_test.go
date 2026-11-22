@@ -243,6 +243,40 @@ func TestDeliverDisabledWebhookKeepsPending(t *testing.T) {
 
 func boolPtr(b bool) *bool { return &b }
 
+// 满批（≥batchSize）禁用 webhook 的 pending 排在前面：投递器不得自唤醒空转，
+// 也不得饿死启用中 webhook 的投递。
+func TestPumpSkipsDisabledWebhooks(t *testing.T) {
+	st, d, ds := newEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(ds.handler))
+	defer srv.Close()
+
+	disabled, err := st.CreateWebhook(&store.Webhook{URL: srv.URL + "/off", Secret: "s", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= batchSize+10; i++ {
+		ingestOne(t, st, uint32(i))
+	}
+	if err := st.ApplyWebhookPatch(disabled, store.WebhookPatch{Enabled: boolPtr(false)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateWebhook(&store.Webhook{URL: srv.URL + "/on", Secret: "s", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	ingestOne(t, st, uint32(batchSize+100)) // 仅启用中的 webhook 入队，id 排在最后
+
+	d.pump(context.Background())
+	if ds.count() != 1 {
+		t.Fatalf("启用中的 webhook 应被投递 1 次，得 %d", ds.count())
+	}
+	if len(d.wake) != 0 {
+		t.Fatal("禁用 webhook 的积压不应触发自唤醒")
+	}
+	if _, total, _ := st.ListDeliveries(store.DeliveryFilter{WebhookID: disabled, Status: "pending"}); total != batchSize+10 {
+		t.Fatalf("禁用 webhook 的投递应保持 pending，得 %d", total)
+	}
+}
+
 func TestPostTest(t *testing.T) {
 	_, d, ds := newEnv(t)
 	srv := httptest.NewServer(http.HandlerFunc(ds.handler))

@@ -338,3 +338,47 @@ func TestFetchFolderDeltaGoneFallback(t *testing.T) {
 		t.Fatalf("退回列表应从 last_seen 游标开始: %s", filterVal)
 	}
 }
+
+// delta 返回 401（ErrReauth）或 429 时不得回退到 fetchList（避免重复打 API 或掩盖认证失败）。
+func TestFetchFolderDeltaNoFallbackOnAuthOr429(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		code    int
+		wantErr error
+	}{
+		{"401", http.StatusUnauthorized, mstoken.ErrReauth},
+		{"429", http.StatusTooManyRequests, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var listHit bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/messages/delta") {
+					w.WriteHeader(tc.code)
+					return
+				}
+				listHit = true
+				fmt.Fprint(w, `{"value":[]}`)
+			}))
+			defer srv.Close()
+
+			tokens := mstoken.NewTokenCache()
+			tokens.Endpoint = newTokenServer(t).URL
+			c := New(tokens, nil)
+			c.SetBase(srv.URL)
+			connect(t, c)
+
+			cursor := &store.FolderState{DeltaLink: srv.URL + "/me/mailFolders/inbox/messages/delta?token=x"}
+			_, err := c.FetchFolder(context.Background(), "INBOX", cursor, time.Now().Add(-time.Hour),
+				func(mailclient.MsgKey, time.Time, []byte) error { return nil })
+			if err == nil {
+				t.Fatal("应返回错误")
+			}
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Fatalf("期望 %v，得 %v", tc.wantErr, err)
+			}
+			if listHit {
+				t.Fatalf("HTTP %d 不应回退到 fetchList", tc.code)
+			}
+		})
+	}
+}

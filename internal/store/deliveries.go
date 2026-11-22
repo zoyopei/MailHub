@@ -38,10 +38,13 @@ func scanDelivery(row interface{ Scan(...any) error }) (*Delivery, error) {
 }
 
 // ListDueDeliveries 取到期待投递记录（pending 且 next_retry_at 已到/为空）。
+// 只取**启用中** webhook 的记录：禁用 webhook 的 pending 保持原样（重新启用后继续），
+// 若不过滤，满批的禁用记录会让投递器反复自唤醒空转并饿死其他 webhook。
 // 单进程内投递器是唯一消费者，批次取走即处理，无需数据库原子 claim。
 func (s *Store) ListDueDeliveries(limit int) ([]*Delivery, error) {
 	rows, err := s.DB.Query(`SELECT `+deliveryCols+` FROM webhook_deliveries
 		WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+		  AND webhook_id IN (SELECT id FROM webhooks WHERE enabled = 1)
 		ORDER BY id LIMIT ?`, time.Now().UTC(), limit)
 	if err != nil {
 		return nil, err

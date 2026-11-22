@@ -92,12 +92,14 @@ var ErrDuplicate = errors.New("duplicate message")
 //     否则 last_uid = max(last_uid, uid)（DESIGN.md 3.4 UIDVALIDITY 处理）
 func (s *Store) IngestMessage(m *NewMessage) (int64, error) {
 	// Graph 路径：UID 由 graph_id 哈希填充（UNIQUE(account,folder,uidv,uid) 键需离散；
-	// 真正的幂等去重靠 idx_messages_graph 唯一索引）。
+	// 真正的幂等去重靠 idx_messages_graph 唯一索引）。32 位哈希会碰撞：下方在事务内
+	// 线性探测空闲 uid，避免不同邮件撞键导致 INSERT 失败、账号永久卡在同一封邮件上。
+	uid := m.UID
 	if m.GraphID != "" {
 		if m.UIDValidity != 0 || m.UID != 0 {
 			return 0, errors.New("Graph 路径不应携带 IMAP UID")
 		}
-		m.UID = HashGraphID(m.GraphID)
+		uid = HashGraphID(m.GraphID)
 	}
 
 	tx, err := s.DB.Begin()
@@ -121,6 +123,27 @@ func (s *Store) IngestMessage(m *NewMessage) (int64, error) {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
+	if m.GraphID != "" {
+		// graph_id 未入库但哈希 uid 被别的邮件占用 → 碰撞，探测下一个空闲 uid。
+		for i := 0; ; i++ {
+			var other int64
+			err := tx.QueryRow(`SELECT id FROM messages WHERE account_id = ? AND folder = ? AND uidvalidity = 0 AND uid = ?`,
+				m.AccountID, m.Folder, uid).Scan(&other)
+			if errors.Is(err, sql.ErrNoRows) {
+				break
+			}
+			if err != nil {
+				return 0, err
+			}
+			if i >= 64 {
+				return 0, errors.New("graph 邮件 uid 探测失败（连续碰撞）")
+			}
+			uid++
+			if uid == 0 {
+				uid = 1
+			}
+		}
+	}
 
 	now := time.Now().UTC()
 	var sentAt any
@@ -138,7 +161,7 @@ func (s *Store) IngestMessage(m *NewMessage) (int64, error) {
 		 sent_at, received_at, body_text, body_html, snippet, size, has_attachments, is_read,
 		 truncated, parse_error, raw_path)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 0, ?, ?, ?)`,
-		m.AccountID, m.Folder, m.UIDValidity, m.UID, nullStr(m.GraphID), m.MessageID, m.Subject, m.FromAddr,
+		m.AccountID, m.Folder, m.UIDValidity, uid, nullStr(m.GraphID), m.MessageID, m.Subject, m.FromAddr,
 		m.ToAddrsJSON, m.CcAddrsJSON, sentAt, recvAt, m.BodyText, m.BodyHTML, m.Snippet, m.Size,
 		boolInt(m.HasAttachments), boolInt(m.Truncated), nullStr(m.ParseError), m.RawPath)
 	if err != nil {
@@ -177,12 +200,12 @@ func (s *Store) IngestMessage(m *NewMessage) (int64, error) {
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		_, err = tx.Exec(`INSERT INTO folder_states (account_id, folder, uidvalidity, last_uid, last_seen_at)
-			VALUES (?,?,?,?,?)`, m.AccountID, m.Folder, m.UIDValidity, m.UID, nullTime(m.SeenAt))
+			VALUES (?,?,?,?,?)`, m.AccountID, m.Folder, m.UIDValidity, uid, nullTime(m.SeenAt))
 	case err == nil && uint32(oldUIDV) == m.UIDValidity:
-		if int64(m.UID) > oldLast {
+		if int64(uid) > oldLast {
 			_, err = tx.Exec(`UPDATE folder_states SET last_uid = ?, last_seen_at = ?
 				WHERE account_id = ? AND folder = ?`,
-				m.UID, coalesceNewer(m.SeenAt), m.AccountID, m.Folder)
+				uid, coalesceNewer(m.SeenAt), m.AccountID, m.Folder)
 		} else if !m.SeenAt.IsZero() {
 			_, err = tx.Exec(`UPDATE folder_states SET last_seen_at = ? WHERE account_id = ? AND folder = ?`,
 				coalesceNewer(m.SeenAt), m.AccountID, m.Folder)
@@ -190,7 +213,7 @@ func (s *Store) IngestMessage(m *NewMessage) (int64, error) {
 	case err == nil: // UIDVALIDITY 变化：归零重写
 		_, err = tx.Exec(`UPDATE folder_states SET uidvalidity = ?, last_uid = ?, last_seen_at = ?
 			WHERE account_id = ? AND folder = ?`,
-			m.UIDValidity, m.UID, nullTime(m.SeenAt), m.AccountID, m.Folder)
+			m.UIDValidity, uid, nullTime(m.SeenAt), m.AccountID, m.Folder)
 	}
 	if err != nil {
 		return 0, err
@@ -328,8 +351,8 @@ func (s *Store) HasGraphIDs(accountID int64, ids []string) (map[string]bool, err
 }
 
 // HashGraphID 简单离散哈希：Graph 路径用 graph_id 填充 UNIQUE(account,folder,uidv,uid)
-// 键的 uid 位（去重以 graph_id 唯一索引为准）。worker 用同一哈希生成 .eml 文件名，
-// 保证文件名与数据库坐标一致。
+// 键的 uid 位（去重以 graph_id 唯一索引为准；碰撞由 IngestMessage 线性探测化解）。
+// .eml 文件名不再使用该 32 位哈希（worker 改用 sha256 前缀，避免碰撞覆盖文件）。
 func HashGraphID(s string) uint32 {
 	const prime = 16777619
 	h := uint32(2166136261)
@@ -464,7 +487,7 @@ func (s *Store) ListMessages(f MessageFilter) ([]*Message, error) {
 
 	pageSQL := " LIMIT ?"
 	args = append(args, limit)
-	if join != "" {
+	if f.Sort != "" {
 		pageSQL = " LIMIT ? OFFSET ?"
 		args = append(args, offset)
 	}
@@ -576,11 +599,23 @@ func (s *Store) SetRead(id int64, isRead bool) error {
 	return nil
 }
 
+// sqlBatchSize 批量 IN (...) 分块大小，避开 SQLite 默认 999 变量上限。
+const sqlBatchSize = 500
+
 // BatchRead 批量标记已读：ids 非空按 id 集合，否则 accountID != 0 时标记该账号全部。
 // 返回受影响行数。
 func (s *Store) BatchRead(ids []int64, accountID int64) (int64, error) {
 	if len(ids) > 0 {
-		return execIn(s.DB, `UPDATE messages SET is_read = 1 WHERE id IN (`+ph(len(ids))+`)`, idsToArgs(ids))
+		var total int64
+		for i := 0; i < len(ids); i += sqlBatchSize {
+			chunk := ids[i:min(i+sqlBatchSize, len(ids))]
+			n, err := execIn(s.DB, `UPDATE messages SET is_read = 1 WHERE id IN (`+ph(len(chunk))+`)`, idsToArgs(chunk))
+			if err != nil {
+				return total, err
+			}
+			total += n
+		}
+		return total, nil
 	}
 	if accountID != 0 {
 		res, err := s.DB.Exec(`UPDATE messages SET is_read = 1 WHERE account_id = ?`, accountID)
@@ -595,16 +630,37 @@ func (s *Store) BatchRead(ids []int64, accountID int64) (int64, error) {
 
 // DeleteMessages 删除本地副本（行 + 附件级联），返回被删邮件的 raw_path 供调用方清理磁盘。
 func (s *Store) DeleteMessages(ids []int64, accountID int64) ([]string, error) {
-	var rows *sql.Rows
-	var err error
-	switch {
-	case len(ids) > 0:
-		rows, err = s.DB.Query(`SELECT raw_path FROM messages WHERE id IN (`+ph(len(ids))+`)`, idsToArgs(ids)...)
-	case accountID != 0:
-		rows, err = s.DB.Query(`SELECT raw_path FROM messages WHERE account_id = ?`, accountID)
-	default:
+	if len(ids) > 0 {
+		var paths []string
+		for i := 0; i < len(ids); i += sqlBatchSize {
+			chunk := ids[i:min(i+sqlBatchSize, len(ids))]
+			args := idsToArgs(chunk)
+			rows, err := s.DB.Query(`SELECT raw_path FROM messages WHERE id IN (`+ph(len(chunk))+`)`, args...)
+			if err != nil {
+				return nil, err
+			}
+			for rows.Next() {
+				var p string
+				if err := rows.Scan(&p); err != nil {
+					rows.Close()
+					return nil, err
+				}
+				paths = append(paths, p)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return nil, err
+			}
+			if _, err := execIn(s.DB, `DELETE FROM messages WHERE id IN (`+ph(len(chunk))+`)`, args); err != nil {
+				return nil, err
+			}
+		}
+		return paths, nil
+	}
+	if accountID == 0 {
 		return nil, errors.New("需要 ids 或 account_id")
 	}
+	rows, err := s.DB.Query(`SELECT raw_path FROM messages WHERE account_id = ?`, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -618,22 +674,36 @@ func (s *Store) DeleteMessages(ids []int64, accountID int64) ([]string, error) {
 		paths = append(paths, p)
 	}
 	rows.Close()
-
-	if len(ids) > 0 {
-		if _, err := execIn(s.DB, `DELETE FROM messages WHERE id IN (`+ph(len(ids))+`)`, idsToArgs(ids)); err != nil {
-			return nil, err
-		}
-	} else {
-		if _, err := s.DB.Exec(`DELETE FROM messages WHERE account_id = ?`, accountID); err != nil {
-			return nil, err
-		}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := s.DB.Exec(`DELETE FROM messages WHERE account_id = ?`, accountID); err != nil {
+		return nil, err
 	}
 	return paths, nil
 }
 
-// DeleteMessage 单封删除，返回 raw_path。
+// DeleteMessage 单封删除，返回 raw_path；邮件不存在时返回 ErrNotFound。
 func (s *Store) DeleteMessage(id int64) ([]string, error) {
-	return s.DeleteMessages([]int64{id}, 0)
+	var rawPath string
+	err := s.DB.QueryRow(`SELECT raw_path FROM messages WHERE id = ?`, id).Scan(&rawPath)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	res, err := s.DB.Exec(`DELETE FROM messages WHERE id = ?`, id)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrNotFound
+	}
+	if rawPath == "" {
+		return nil, nil
+	}
+	return []string{rawPath}, nil
 }
 
 // DeleteMessagesOlderThan retention 清理（DESIGN.md 9.1 MAILHUB_RETENTION_DAYS）：

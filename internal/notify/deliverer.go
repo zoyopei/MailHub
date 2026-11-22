@@ -63,6 +63,8 @@ func (d *Deliverer) Run(ctx context.Context) {
 	slog.Info("webhook deliverer started", "concurrency", d.cfg.WebhookConcurrency)
 	cleanup := time.NewTicker(cleanupTick)
 	defer cleanup.Stop()
+	timer := time.NewTimer(wakeTick)
+	defer timer.Stop()
 
 	for {
 		select {
@@ -76,9 +78,16 @@ func (d *Deliverer) Run(ctx context.Context) {
 			}
 			continue
 		case <-d.wake:
-		case <-time.After(wakeTick):
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
 		}
 		d.pump(ctx)
+		timer.Reset(wakeTick)
 	}
 }
 

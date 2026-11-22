@@ -535,11 +535,11 @@ func TestWorkerIdleLoop(t *testing.T) {
 		return len(msgs) == 3
 	})
 
-	// 心跳在 IDLE 模式下持续更新（每次拉取成功）
-	a, _ := st.GetAccount(id)
-	if !a.LastSyncAt.Valid {
-		t.Fatal("IDLE 模式心跳未更新")
-	}
+	// 心跳与状态：IDLE 模式下应处于 idle 状态且心跳持续更新
+	waitFor(t, func() bool {
+		a, err := st.GetAccount(id)
+		return err == nil && a.LastSyncAt.Valid && a.Status == store.StatusIdle
+	})
 
 	cancel()
 	select {
@@ -602,8 +602,15 @@ func TestIdleBudget(t *testing.T) {
 		t.Fatal("释放后应可再次占用")
 	}
 
-	if !b.Acquire("h3", 0) || !b.Acquire("h3", 0) { // limit<=0：不限
+	if !b.Acquire("h3", 0) || !b.Acquire("h3", 0) { // limit<=0：不限，但仍计数
 		t.Fatal("limit<=0 应视为不限")
+	}
+	if b.Acquire("h3", 2) { // 运行时切到限额 2：已有 2 个活跃连接，应被拒
+		t.Fatal("切到限额 2 后已有 2 个活跃连接应被拒")
+	}
+	b.Release("h3")
+	if !b.Acquire("h3", 2) {
+		t.Fatal("释放 1 个后应可再次占用")
 	}
 
 	var nilBudget *idleBudget // nil 容错：视为不限

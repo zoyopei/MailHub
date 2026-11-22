@@ -41,13 +41,16 @@ func NewGoClient(tokens *mstoken.TokenCache) mailclient.MailClient {
 
 func (g *goClient) Connect(ctx context.Context, host string, port int, username string, cred mailclient.Credentials) (string, error) {
 	addr := fmt.Sprintf("%s:%d", host, port)
-	cl, err := imapclient.DialTLS(addr, &imapclient.Options{
-		TLSConfig: &tls.Config{ServerName: host},
-		Dialer:    &net.Dialer{Timeout: 30 * time.Second},
-	})
+	// 使用 tls.Dialer.DialContext 透传 ctx：停机或删除账号可立即中断卡住的 TCP/TLS 握手。
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 30 * time.Second},
+		Config:    &tls.Config{ServerName: host},
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return "", fmt.Errorf("连接 %s: %w", addr, err)
 	}
+	cl := imapclient.New(conn, nil)
 	g.conn = cl
 
 	switch cred.AuthType {
@@ -111,10 +114,6 @@ func (g *goClient) FetchFolder(ctx context.Context, folder string, cursor *store
 	if len(uids) == 0 {
 		return mailclient.FetchResult{}, nil
 	}
-	var set imap.UIDSet
-	for _, uid := range uids {
-		set.AddNum(uid)
-	}
 	fetchOpts := &imap.FetchOptions{
 		UID:          true,
 		InternalDate: true, // 服务器记录的到达时间 → received_at（邮件真实时间）
@@ -122,23 +121,45 @@ func (g *goClient) FetchFolder(ctx context.Context, folder string, cursor *store
 			{Specifier: imap.PartSpecifierNone, Peek: true}, // BODY.PEEK[]：完整原文，不改 \Seen
 		},
 	}
-	bufs, err := g.conn.Fetch(&set, fetchOpts).Collect()
-	if err != nil {
-		return mailclient.FetchResult{}, fmt.Errorf("UID FETCH: %w", err)
-	}
-	for _, buf := range bufs {
-		raw := rawBytes(buf)
-		if raw == nil {
-			continue
-		}
-		// seenAt = INTERNALDATE（邮件到达邮箱的真实时间；个别服务器缺失时由 worker 用 Date 头兜底）
-		if err := handle(mailclient.MsgKey{UIDValidity: uidv, UID: uint32(buf.UID)}, buf.InternalDate, raw); err != nil {
-			return mailclient.FetchResult{}, err
-		}
-		select {
-		case <-ctx.Done():
+	// 分批 + 流式读取（cmd.Next）：每批至多 fetchBatchSize 封、单次仅持一封原文在内存，
+	// 避免首次同步大邮箱时 Collect() 一次性加载全部邮件引发 OOM，同时及时响应 ctx 取消。
+	const fetchBatchSize = 20
+	for start := 0; start < len(uids); start += fetchBatchSize {
+		if ctx.Err() != nil {
 			return mailclient.FetchResult{}, ctx.Err()
-		default:
+		}
+		end := min(start+fetchBatchSize, len(uids))
+		var set imap.UIDSet
+		for _, uid := range uids[start:end] {
+			set.AddNum(uid)
+		}
+		cmd := g.conn.Fetch(&set, fetchOpts)
+		for {
+			msg := cmd.Next()
+			if msg == nil {
+				break
+			}
+			buf, err := msg.Collect()
+			if err != nil {
+				_ = cmd.Close()
+				return mailclient.FetchResult{}, fmt.Errorf("UID FETCH: %w", err)
+			}
+			raw := rawBytes(buf)
+			if raw == nil {
+				continue
+			}
+			// seenAt = INTERNALDATE（邮件到达邮箱的真实时间；个别服务器缺失时由 worker 用 Date 头兜底）
+			if err := handle(mailclient.MsgKey{UIDValidity: uidv, UID: uint32(buf.UID)}, buf.InternalDate, raw); err != nil {
+				_ = cmd.Close()
+				return mailclient.FetchResult{}, err
+			}
+			if ctx.Err() != nil {
+				_ = cmd.Close()
+				return mailclient.FetchResult{}, ctx.Err()
+			}
+		}
+		if err := cmd.Close(); err != nil {
+			return mailclient.FetchResult{}, fmt.Errorf("UID FETCH: %w", err)
 		}
 	}
 	return mailclient.FetchResult{}, nil
@@ -152,11 +173,6 @@ func (g *goClient) SupportsIdle() bool {
 	return g.conn.Caps().Has(imap.CapIdle)
 }
 
-// idleWaitTimeout 单次 IDLE 等待上限：go-imap 内部每 28 分钟自动重启 IDLE
-// （协议要求 29 分钟内刷新），这里 25 分钟到点正常返回由 worker 决定下一步
-// （通常重新进入 IDLE，同时是心跳/兜底拉取的检查点，DESIGN.md 3.2）。
-const idleWaitTimeout = 25 * time.Minute
-
 // Idle 阻塞等待服务器 unilateral 数据（EXISTS/EXPUNGE 等）或超时。
 // 任何服务器动静都返回 notified=true——EXPUNGE/FLAGS 也会触发，worker 做
 // 一次增量拉取即可分辨（无新邮件时为 no-op 并顺带推进心跳）。
@@ -169,6 +185,9 @@ func (g *goClient) Idle(ctx context.Context, timeout time.Duration) (bool, error
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	select {
 	case err := <-done: // 服务器数据到达（或 IDLE 出错）
 		return err == nil, err
@@ -176,7 +195,7 @@ func (g *goClient) Idle(ctx context.Context, timeout time.Duration) (bool, error
 		_ = cmd.Close()
 		<-done
 		return false, ctx.Err()
-	case <-time.After(timeout):
+	case <-timer.C:
 		_ = cmd.Close()
 		<-done
 		return false, nil

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 
 	"github.com/go-chi/chi/v5"
 
@@ -62,6 +63,10 @@ func (s *Server) handleWebhookCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "需要合法 JSON 且 url 必填")
 		return
 	}
+	if !validWebhookURL(req.URL) {
+		writeErr(w, http.StatusBadRequest, "bad_url", "url 必须是 http(s):// 开头的绝对地址")
+		return
+	}
 	if req.Secret == "" {
 		b := make([]byte, 24)
 		_, _ = rand.Read(b)
@@ -72,7 +77,7 @@ func (s *Server) handleWebhookCreate(w http.ResponseWriter, r *http.Request) {
 		enabled = *req.Enabled
 	}
 	wh := &store.Webhook{URL: req.URL, Secret: req.Secret, IncludeBody: req.IncludeBody, Enabled: enabled}
-	if req.AccountIDs != nil {
+	if len(req.AccountIDs) > 0 {
 		wh.AccountIDs.String = mustJSON(req.AccountIDs)
 		wh.AccountIDs.Valid = true
 	}
@@ -135,6 +140,10 @@ func (s *Server) handleWebhookPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法 JSON")
+		return
+	}
+	if req.URL != nil && !validWebhookURL(*req.URL) {
+		writeErr(w, http.StatusBadRequest, "bad_url", "url 必须是 http(s):// 开头的绝对地址")
 		return
 	}
 	p := store.WebhookPatch{URL: req.URL, AccountIDs: req.AccountIDs,
@@ -254,4 +263,10 @@ func (s *Server) handleDeliveryRetry(w http.ResponseWriter, r *http.Request) {
 func mustJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// validWebhookURL 仅接受 http/https 绝对地址（拒绝 file:、javascript: 等与无主机地址）。
+func validWebhookURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
