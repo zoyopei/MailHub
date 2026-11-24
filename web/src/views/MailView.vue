@@ -182,10 +182,10 @@ async function refreshInPlace(): Promise<void> {
       if (seq !== listSeq) return
       state.total = resp.total
       state.hasMore = state.msgs.length > 0 && state.msgs.length < resp.total
-      // 头部没变（新邮件不在当前筛选范围内，或排在已加载段之后）：不动列表，
+      // 头部没变（新邮件不在当前筛选范围内，或排在已加载段之后，且已读状态未变）：不动列表，
       // 免得打断正在进行的勾选和阅读
       if (resp.messages.length === before.length
-        && resp.messages.every((m, i) => m.id === before[i].id)) return
+        && resp.messages.every((m, i) => m.id === before[i].id && m.is_read === before[i].is_read)) return
       state.msgs = mergeRefreshed(resp.messages, limit, resp.total, before)
       state.hasMore = state.msgs.length > 0 && state.msgs.length < resp.total
       checked.value = pruneChecked(checked.value, state.msgs.map(m => m.id))
@@ -355,7 +355,7 @@ function deleteChecked() {
           { ids: [...checked.value] })
         message.success(`已删除 ${r.deleted} 封`)
         checked.value = new Set()
-        selected.value = null
+        closeDetail()
         loadMessages(); loadAccounts()
       } catch (e) { message.error((e as Error).message) }
     },
@@ -374,6 +374,8 @@ function clearAccount() {
         const r = await request<{ deleted: number }>('POST', '/api/v1/messages/batch-delete',
           { account_id: selectedAccount.value })
         message.success(`已删除 ${r.deleted} 封`)
+        checked.value = new Set()
+        closeDetail()
         loadMessages(); loadAccounts()
       } catch (e) { message.error((e as Error).message) }
     },
