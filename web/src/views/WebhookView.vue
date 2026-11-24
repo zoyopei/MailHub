@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// Webhook 管理工作区（DESIGN.md 6.4）：配置 CRUD、测试事件、投递记录与手动重发。
+// Webhook 管理工作区（DESIGN.md 7.4 / 6.4）：配置 CRUD、测试事件、投递记录与手动重发。
 import { h, onMounted, ref } from 'vue'
 import {
   NButton, NCard, NEmpty, NInput, NModal, NSelect, NSpace, NSwitch, NTag, NText,
@@ -7,6 +7,7 @@ import {
   useMessage, useDialog, type DataTableColumns,
 } from 'naive-ui'
 import { relTime, request } from '../api'
+import { fetchAllPages } from '../lib/maillist'
 import type { Account } from '../types'
 
 const message = useMessage()
@@ -53,12 +54,14 @@ const form = ref({ url: '', account_ids: [] as number[] | null, include_body: fa
 const saving = ref(false)
 const createdSecret = ref('') // 创建成功后唯一一次显示
 
-// 账号下拉选项（矩阵场景只拉前 200 个供选择；范围大的场景用"全部账号"）
+// 账号下拉选项：逐页取齐（一页最多 200 个）。只取第一页的话，矩阵超过 200 个账号时排在
+// 后面的就选不进 Webhook 范围；下拉本身可搜索，账号多也找得到。
 const accountOptions = ref<{ label: string; value: number }[]>([])
 
 async function loadAccountOptions() {
   try {
-    const resp = await request<{ accounts: Account[] }>('GET', '/api/v1/accounts?limit=200')
+    const resp = await fetchAllPages(page => request<{ total: number; accounts: Account[] }>(
+      'GET', `/api/v1/accounts?limit=200&page=${page}`))
     accountOptions.value = resp.accounts.map(a => ({ label: a.email, value: a.id }))
   } catch { /* 下拉选项非关键 */ }
 }

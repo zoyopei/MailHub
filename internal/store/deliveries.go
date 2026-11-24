@@ -85,11 +85,13 @@ func (s *Store) MarkDeliveryFailed(id int64, code int, errMsg string, nextRetry 
 	return err
 }
 
-// RetryDelivery 手动重发：failed/pending → 立即待投递。
+// RetryDelivery 手动重发：→ 立即待投递，并把重试计数清零。
+// attempts 不清零的话，已经重试耗尽（attempts=6）的记录只要再失败一次就直接回到终态
+// failed——手动重发等于只有一次机会，根本没机会走完 10s/1m/5m/30m/2h 的重试。
 func (s *Store) RetryDelivery(id int64) error {
 	res, err := s.DB.Exec(`UPDATE webhook_deliveries
-		SET status = 'pending', next_retry_at = NULL, updated_at = ? WHERE id = ?`,
-		time.Now().UTC(), id)
+		SET status = 'pending', attempts = 0, next_retry_at = NULL, last_error = NULL, response_code = NULL,
+			updated_at = ? WHERE id = ?`, time.Now().UTC(), id)
 	if err != nil {
 		return err
 	}
@@ -165,10 +167,13 @@ func (s *Store) WebhookDeliveryStats() (map[int64][2]int, error) {
 	return out, rows.Err()
 }
 
-// CleanOldDeliveries 清理超期投递记录（DESIGN 5.3：保留 30 天）。返回删除数。
+// CleanOldDeliveries 清理超期的**终态**投递记录（DESIGN 5.3：保留 30 天）。返回删除数。
+// 只删 success/failed：pending 是还没送达的邮件——比如 webhook 被禁用期间排队的那些，
+// 重新启用后本该继续投递。按时间一刀切会把它们悄悄删掉。
 func (s *Store) CleanOldDeliveries(retention time.Duration) (int64, error) {
 	cutoff := time.Now().UTC().Add(-retention)
-	res, err := s.DB.Exec(`DELETE FROM webhook_deliveries WHERE updated_at < ?`, cutoff)
+	res, err := s.DB.Exec(`DELETE FROM webhook_deliveries
+		WHERE status IN ('success','failed') AND updated_at < ?`, cutoff)
 	if err != nil {
 		return 0, err
 	}

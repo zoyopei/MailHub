@@ -26,10 +26,8 @@ import (
 var retryDelays = []time.Duration{10 * time.Second, time.Minute, 5 * time.Minute, 30 * time.Minute, 2 * time.Hour}
 
 const (
-	batchSize    = 50               // 每轮取件上限
-	wakeTick     = 15 * time.Second // 空闲轮询周期（兜底，正常由 Wake 触发）
-	cleanupTick  = 6 * time.Hour    // 投递记录清理周期
-	deliveryKeep = 30 * 24 * time.Hour
+	batchSize = 50               // 每轮取件上限
+	wakeTick  = 15 * time.Second // 空闲轮询周期（兜底，正常由 Wake 触发）
 )
 
 // Deliverer 扫描 pending 投递并并发 POST。实现 sync.Notifier（Wake）。
@@ -58,11 +56,9 @@ func (d *Deliverer) Wake() {
 	}
 }
 
-// Run 阻塞直至 ctx 取消。
+// Run 阻塞直至 ctx 取消。投递记录的清理不在这里：与 retention 一道由 maintain 每日执行。
 func (d *Deliverer) Run(ctx context.Context) {
 	slog.Info("webhook deliverer started", "concurrency", d.cfg.WebhookConcurrency)
-	cleanup := time.NewTicker(cleanupTick)
-	defer cleanup.Stop()
 	timer := time.NewTimer(wakeTick)
 	defer timer.Stop()
 
@@ -70,13 +66,6 @@ func (d *Deliverer) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-cleanup.C:
-			if n, err := d.store.CleanOldDeliveries(deliveryKeep); err != nil {
-				slog.Error("clean deliveries failed", "error", err)
-			} else if n > 0 {
-				slog.Info("cleaned old deliveries", "deleted", n)
-			}
-			continue
 		case <-d.wake:
 			if !timer.Stop() {
 				select {

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -18,6 +19,9 @@ import (
 type WebhookTester interface {
 	PostTest(wh *store.Webhook) (int, error)
 }
+
+// minWebhookSecret 自定义签名密钥的最小长度（字符）。
+const minWebhookSecret = 16
 
 func (s *Server) mountWebhooks(r chi.Router) {
 	r.Post("/webhooks", s.handleWebhookCreate)
@@ -65,6 +69,13 @@ func (s *Server) handleWebhookCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validWebhookURL(req.URL) {
 		writeErr(w, http.StatusBadRequest, "bad_url", "url 必须是 http(s):// 开头的绝对地址")
+		return
+	}
+	// 签名密钥太短可以被暴力猜出（猜中就能伪造"新邮件"事件）：自定义 secret 设下限。
+	// 自动生成的是 24 字节随机数的 base64（32 个字符），满足要求。
+	if req.Secret != "" && len(req.Secret) < minWebhookSecret {
+		writeErr(w, http.StatusBadRequest, "weak_secret",
+			fmt.Sprintf("自定义 secret 至少 %d 个字符（不传则自动生成）", minWebhookSecret))
 		return
 	}
 	if req.Secret == "" {
@@ -241,7 +252,7 @@ func (s *Server) handleWebhookDeliveries(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"total": total, "deliveries": out})
 }
 
-// handleDeliveryRetry 手动重发（failed → pending，立即投递）。
+// handleDeliveryRetry 手动重发（→ pending，重试计数清零，立即投递）。
 func (s *Server) handleDeliveryRetry(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {

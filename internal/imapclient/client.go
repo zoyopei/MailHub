@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -49,6 +50,22 @@ type goClient struct {
 	tokens     *mstoken.TokenCache
 	activity   *activityConn // 记录"最近收到数据"时刻的连接，看门狗用
 	unilateral chan struct{} // 服务器通告邮箱变化（EXISTS）的信号，cap=1，由 Idle 消费
+}
+
+// startTLSPort 明文端口：按惯例 143 端口先建立 TCP 连接再用 STARTTLS 升级加密。
+// 其他端口（默认 993）一律按隐式 TLS 处理。变量只为测试替换（测试监听不了 143）。
+var startTLSPort = 143
+
+// tlsConfigForHost TLS 校验配置：按连接的主机名校验服务器证书。
+// 包级变量只为测试替换（信任自签名的假服务器证书）；生产代码不要改它。
+var tlsConfigForHost = func(host string) *tls.Config {
+	return &tls.Config{ServerName: host}
+}
+
+// dialAddr 主机 + 端口 → 拨号地址。用 net.JoinHostPort 而不是字符串拼接：
+// IPv6 字面量必须加方括号（"[2001:db8::1]:993"），拼接会得到非法地址。
+func dialAddr(host string, port int) string {
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 // NewGoClient 构造实现。tokens 传 nil 时内部自动创建。
@@ -90,7 +107,8 @@ func (c *activityConn) touchedAt() time.Time {
 // 返回错误。
 type watchdog struct {
 	ctx      context.Context
-	cl       *imapclient.Client
+	raw      net.Conn           // 底层连接；cl 为 nil（STARTTLS 握手期间，客户端对象还没建好）时关它
+	cl       *imapclient.Client // 可为 nil
 	lastRead *activityConn
 	stall    time.Duration // 无响应判定阈值（启动时的 stallTimeout 快照）
 	progress atomic.Int64  // 最近一次本地进展（unixNano）
@@ -99,13 +117,22 @@ type watchdog struct {
 	done     chan struct{}
 }
 
-// startWatch 开始监视，返回的看门狗必须且只能 stop 一次。
-func (g *goClient) startWatch(ctx context.Context) *watchdog {
-	w := &watchdog{ctx: ctx, cl: g.conn, lastRead: g.activity, stall: stallTimeout,
+// startWatch 开始监视 cl（nil = 客户端对象尚未建立，只能关底层连接）。返回的看门狗必须且只能 stop 一次。
+func (g *goClient) startWatch(ctx context.Context, cl *imapclient.Client) *watchdog {
+	w := &watchdog{ctx: ctx, raw: g.activity, cl: cl, lastRead: g.activity, stall: stallTimeout,
 		done: make(chan struct{})}
 	w.progress.Store(time.Now().UnixNano())
 	go w.run()
 	return w
+}
+
+// kill 断开连接：有客户端对象就关它（同时让挂起的命令出错返回），否则关底层连接。
+func (w *watchdog) kill() {
+	if w.cl != nil {
+		w.cl.Close()
+		return
+	}
+	_ = w.raw.Close()
 }
 
 func (w *watchdog) run() {
@@ -116,7 +143,7 @@ func (w *watchdog) run() {
 		case <-w.done:
 			return
 		case <-w.ctx.Done():
-			w.cl.Close()
+			w.kill()
 			return
 		case <-ticker.C:
 			if w.paused.Load() {
@@ -134,7 +161,7 @@ func (w *watchdog) run() {
 			default:
 			}
 			w.stalled.Store(true)
-			w.cl.Close()
+			w.kill()
 			return
 		}
 	}
@@ -167,14 +194,28 @@ func (w *watchdog) decorate(err error) error {
 	return err
 }
 
+// Connect 建立连接并登录。加密方式按端口选择：
+//   - 143：明文 TCP + STARTTLS。升级失败（服务器不支持、握手或证书校验失败）直接报错——
+//     绝不在明文连接上发登录命令；
+//   - 其余端口（默认 993）：隐式 TLS。
 func (g *goClient) Connect(ctx context.Context, host string, port int, username string, cred mailclient.Credentials) (string, error) {
-	addr := fmt.Sprintf("%s:%d", host, port)
-	// 使用 tls.Dialer.DialContext 透传 ctx：停机或删除账号可立即中断卡住的 TCP/TLS 握手。
-	dialer := &tls.Dialer{
-		NetDialer: &net.Dialer{Timeout: 30 * time.Second},
-		Config:    &tls.Config{ServerName: host},
+	addr := dialAddr(host, port)
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	if port == startTLSPort {
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return "", fmt.Errorf("连接 %s: %w", addr, err)
+		}
+		rotated, err := g.loginStartTLS(ctx, conn, host, username, cred)
+		if err != nil {
+			_ = conn.Close() // NewStartTLS 失败时它自己会关；这里兜底其余路径
+			return "", err
+		}
+		return rotated, nil
 	}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	// 使用 tls.Dialer.DialContext 透传 ctx：停机或删除账号可立即中断卡住的 TCP/TLS 握手。
+	tlsDialer := &tls.Dialer{NetDialer: dialer, Config: tlsConfigForHost(host)}
+	conn, err := tlsDialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return "", fmt.Errorf("连接 %s: %w", addr, err)
 	}
@@ -186,12 +227,10 @@ func (g *goClient) Connect(ctx context.Context, host string, port int, username 
 	return rotated, nil
 }
 
-// login 在已建立的连接上创建客户端并认证。与 Connect 分开是为了能用 net.Pipe 假服务器
-// 测试（Connect 强制 TLS）。
-func (g *goClient) login(ctx context.Context, conn net.Conn, username string, cred mailclient.Credentials) (string, error) {
-	g.activity = &activityConn{Conn: conn}
-	g.unilateral = make(chan struct{}, 1)
-	g.conn = imapclient.New(g.activity, &imapclient.Options{
+// options go-imap 客户端选项。tlsCfg 仅 STARTTLS 用到（NewStartTLS 用它做握手与证书校验）。
+func (g *goClient) options(tlsCfg *tls.Config) *imapclient.Options {
+	return &imapclient.Options{
+		TLSConfig: tlsCfg,
 		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
 			// 服务器通告的邮箱变化。EXAMINE 期间的 EXISTS 归属那条 Select 命令，不会走到
 			// 这里；走到这里的是 IDLE 等待期间（或两条命令之间）的 EXISTS = 有新邮件。
@@ -206,13 +245,49 @@ func (g *goClient) login(ctx context.Context, conn net.Conn, username string, cr
 				}
 			},
 		},
-	})
+	}
+}
+
+// login 在已建立的（隐式 TLS）连接上创建客户端并认证。与 Connect 分开是为了能用 net.Pipe
+// 假服务器测试（Connect 强制 TLS）。
+func (g *goClient) login(ctx context.Context, conn net.Conn, username string, cred mailclient.Credentials) (string, error) {
+	g.activity = &activityConn{Conn: conn}
+	g.unilateral = make(chan struct{}, 1)
+	g.conn = imapclient.New(g.activity, g.options(nil))
 	// 先等问候：服务器以 "* BYE" 拒绝接入时，后面任何命令都只会得到一个含义不明的
 	// 写入错误（读 goroutine 已经退出），拿不到 BYE 的原文。
 	if err := g.conn.WaitGreeting(); err != nil {
 		return "", fmt.Errorf("IMAP 问候: %w", err)
 	}
+	return g.authenticate(ctx, username, cred)
+}
 
+// loginStartTLS 在明文连接上完成 STARTTLS 升级并认证（143 端口）。
+func (g *goClient) loginStartTLS(ctx context.Context, conn net.Conn, host, username string,
+	cred mailclient.Credentials) (string, error) {
+	g.activity = &activityConn{Conn: conn}
+	g.unilateral = make(chan struct{}, 1)
+	// STARTTLS 命令的应答与 TLS 握手都由 imapclient.NewStartTLS 内部完成，期间客户端对象
+	// 还没建好；握手没有超时，所以先开一个只盯底层连接的看门狗（ctx 取消或服务器卡住就断开）。
+	wd := g.startWatch(ctx, nil)
+	cl, err := imapclient.NewStartTLS(g.activity, g.options(tlsConfigForHost(host)))
+	if err != nil {
+		wd.stop()
+		// 不附带服务器返回的细节以外的敏感信息；证书类错误（x509）原样带出便于排错。
+		return "", wd.decorate(fmt.Errorf(
+			"STARTTLS（端口 %d）：服务器不支持或证书校验失败，拒绝明文登录: %w", startTLSPort, err))
+	}
+	g.conn = cl
+	wd.stop() // 之后由 authenticate 自己的看门狗负责
+	// NewStartTLS 已消费问候（并在明文连接上拒绝 PREAUTH）；这里只是防御性确认。
+	if err := g.conn.WaitGreeting(); err != nil {
+		return "", fmt.Errorf("IMAP 问候: %w", err)
+	}
+	return g.authenticate(ctx, username, cred)
+}
+
+// authenticate 发认证命令（调用前问候已被消费）。
+func (g *goClient) authenticate(ctx context.Context, username string, cred mailclient.Credentials) (string, error) {
 	switch cred.AuthType {
 	case "oauth2":
 		// 取令牌不在看门狗监视内：它走 HTTP（mstoken 自带超时），期间 IMAP 连接本来就没有数据。
@@ -220,14 +295,14 @@ func (g *goClient) login(ctx context.Context, conn net.Conn, username string, cr
 		if err != nil {
 			return "", err
 		}
-		wd := g.startWatch(ctx)
+		wd := g.startWatch(ctx, g.conn)
 		defer wd.stop()
 		if err := g.conn.Authenticate(newXOAUTH2(username, access)); err != nil {
 			return "", authError(wd.decorate(err), "XOAUTH2 被拒绝（确认账号已启用 IMAP 且令牌含 IMAP 权限）")
 		}
 		return rotated, nil
 	default: // password / 授权码
-		wd := g.startWatch(ctx)
+		wd := g.startWatch(ctx, g.conn)
 		defer wd.stop()
 		if err := g.conn.Login(username, cred.Password).Wait(); err != nil {
 			return "", authError(wd.decorate(err), "")
@@ -261,14 +336,17 @@ func isAuthRejection(err error) bool {
 // FetchFolder 只读打开文件夹并增量拉取：
 //   - cursor 有效且 UIDVALIDITY 一致 → UID > last_uid 增量；
 //   - 无游标或 UIDVALIDITY 变化 → 归零重拉，时间窗取 since（首次同步窗口，
-//     DESIGN.md 3.4；重复邮件由 UNIQUE 约束幂等忽略）。
+//     DESIGN.md 3.4；重复邮件由 worker 标记 Reindex、IngestMessage 按 Message-ID 幂等忽略）。
 //
-// Graph 的游标产出（latestSeen/deltaLink）在 IMAP 路径不适用，恒返回零值。
+// 结果带回文件夹当前的 UIDVALIDITY 与本轮的最大 UID，供 worker 在整轮成功后推进游标
+// （一封都没拉到时：增量路径为 0 即不推进；首次同步为现有邮件的最大 UID，见下方注释）。
+// Graph 的游标产出（latestSeen/deltaLink）在 IMAP 路径
+// 不适用，恒返回零值。
 // 整个过程在看门狗监视下：服务器无响应或 ctx 取消都会让阻塞的命令立即出错返回。
 func (g *goClient) FetchFolder(ctx context.Context, folder string, cursor *store.FolderState, since time.Time,
 	handle func(key mailclient.MsgKey, seenAt time.Time, raw []byte) error) (res mailclient.FetchResult, err error) {
 
-	wd := g.startWatch(ctx)
+	wd := g.startWatch(ctx, g.conn)
 	defer wd.stop()
 	defer func() { err = wd.decorate(err) }()
 
@@ -277,6 +355,7 @@ func (g *goClient) FetchFolder(ctx context.Context, folder string, cursor *store
 		return mailclient.FetchResult{}, fmt.Errorf("EXAMINE %s: %w", folder, err)
 	}
 	uidv := sel.UIDValidity
+	res.UIDValidity = uidv
 
 	var lastUID uint32
 	var window time.Time
@@ -287,8 +366,9 @@ func (g *goClient) FetchFolder(ctx context.Context, folder string, cursor *store
 	}
 
 	criteria := &imap.SearchCriteria{}
-	if lastUID > 0 {
-		// "n:*"（stop 为 0 表示 *）：各服务器通吃的标准写法。
+	if cursor != nil && cursor.UIDValidity == uidv {
+		// "n:*"（stop 为 0 表示 *）：各服务器通吃的标准写法。lastUID 为 0（空文件夹建立游标时）
+		// 即 "1:*"，空邮箱上不匹配任何邮件。
 		var set imap.UIDSet
 		set.AddRange(imap.UID(lastUID+1), 0)
 		criteria.UID = []imap.UIDSet{set}
@@ -301,8 +381,49 @@ func (g *goClient) FetchFolder(ctx context.Context, folder string, cursor *store
 		return mailclient.FetchResult{}, fmt.Errorf("UID SEARCH: %w", err)
 	}
 	uids := data.AllUIDs()
+	if cursor != nil && cursor.UIDValidity == uidv {
+		// 增量路径只认游标之后的 UID。"n:*" 在 n 比文件夹里任何 UID 都大时**仍然匹配最后一封**
+		// （RFC 3501），所以没有新邮件时服务器不会回空，而是带回游标处的那封：
+		//   - 它已经入库：重复下载一遍全文、解析、走一次因唯一索引而回滚的事务。千级账号、
+		//     大部分邮箱数天一封，这点冗余就是 IMAP 路径的主要流量；
+		//   - 首次同步时窗口内一封都没有（邮件全部早于窗口）：游标取的是现有最大 UID，那封邮件
+		//     早于窗口、从没入库过，又不带重拉标记——会被当成**新邮件**入库并通知一次。
+		// 不依赖服务器对 "n:*" 的实现细节，这里一律滤掉。
+		kept := uids[:0]
+		for _, uid := range uids {
+			if uint32(uid) > lastUID {
+				kept = append(kept, uid)
+			}
+		}
+		uids = kept
+	}
 	if len(uids) == 0 {
-		return mailclient.FetchResult{}, nil
+		// 没有新邮件。增量路径（游标有效）不动游标：下一轮照样搜 "n:*"，空结果很便宜。
+		//
+		// 首次同步且窗口内一封都没有（空文件夹，或邮件全部早于窗口）：必须建游标，否则每轮
+		// 都按"首次同步"重扫整个时间窗、新邮件也被当成历史邮件不通知。游标取"现有邮件的最大
+		// UID"——再搜一次 UID 1:*（只回序号，不下载正文）。不能用 EXAMINE 报的 UIDNEXT 推算：
+		//   - UIDNEXT-1：UIDNEXT 可能已经计入正在投递的邮件（UID 已分配、还不响应 SEARCH），
+		//     那封邮件会落在游标之前，永远拉不到；
+		//   - UIDNEXT-2（留余量）：没有投递中邮件时它比最大 UID 小 1，下一轮 "n:*" 会把最新的
+		//     那封旧邮件（早于窗口、从未入库）也带出来——增量路径没有重拉标记，它被当成新邮件
+		//     入库并通知。久不收信的邮箱正是这种情况。
+		// 按实际搜到的最大值定游标没有这些问题：投递中的邮件此刻不在结果里，之后可见时 UID
+		// 大于游标，下一轮 "n:*" 自然带出。搜索失败则整轮报错，游标不动，下一轮重来。
+		if cursor == nil || cursor.UIDValidity != uidv {
+			max, err := g.maxVisibleUID()
+			if err != nil {
+				return mailclient.FetchResult{}, fmt.Errorf("UID SEARCH（取最大 UID）: %w", err)
+			}
+			res.LastUID = max
+		}
+		return res, nil
+	}
+	// 不依赖服务器返回 UID 的顺序，显式取最大值。
+	for _, uid := range uids {
+		if uint32(uid) > res.LastUID {
+			res.LastUID = uint32(uid)
+		}
 	}
 	fetchOpts := &imap.FetchOptions{
 		UID:          true,
@@ -358,7 +479,25 @@ func (g *goClient) FetchFolder(ctx context.Context, folder string, cursor *store
 			return mailclient.FetchResult{}, fmt.Errorf("UID FETCH: %w", err)
 		}
 	}
-	return mailclient.FetchResult{}, nil
+	return res, nil
+}
+
+// maxVisibleUID 文件夹里现有邮件的最大 UID（空文件夹为 0）：一次 UID SEARCH UID 1:*，
+// 只回序号、不下载正文。用于首次同步空结果时建立游标（见 FetchFolder）。
+func (g *goClient) maxVisibleUID() (uint32, error) {
+	var set imap.UIDSet
+	set.AddRange(1, 0) // 1:*（0 表示 *）
+	data, err := g.conn.UIDSearch(&imap.SearchCriteria{UID: []imap.UIDSet{set}}, nil).Wait()
+	if err != nil {
+		return 0, err
+	}
+	var max uint32
+	for _, uid := range data.AllUIDs() {
+		if uint32(uid) > max {
+			max = uint32(uid)
+		}
+	}
+	return max, nil
 }
 
 // SupportsIdle 服务器是否通告 IDLE 能力（RFC 2177）。
@@ -381,7 +520,7 @@ func (g *goClient) SupportsIdle() bool {
 // 进行）。任何错误都意味着连接已不可信，调用方应重新连接。
 func (g *goClient) Idle(ctx context.Context, timeout time.Duration) (bool, error) {
 	// 握手（发出 IDLE → 等服务器 "+ idling"）由看门狗保护。
-	wd := g.startWatch(ctx)
+	wd := g.startWatch(ctx, g.conn)
 	cmd, err := g.conn.Idle()
 	wd.stop()
 	if err != nil {

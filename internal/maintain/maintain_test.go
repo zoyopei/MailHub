@@ -150,3 +150,38 @@ func TestOnceNoMailsDir(t *testing.T) {
 	cfg := &config.Config{DataDir: dir, RetentionDays: 30}
 	Once(context.Background(), cfg, st) // 不 panic 即可
 }
+
+// 投递记录的清理归每日维护（不再挂在投递器上）：终态记录保留 30 天，pending 的不删。
+func TestOnceCleansDeliveries(t *testing.T) {
+	cfg, st, _ := setup(t, 0)
+	whID, err := st.CreateWebhook(&store.Webhook{URL: "http://127.0.0.1:1/hook", Secret: "s", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := st.ListMessages(store.MessageFilter{})
+	old := time.Now().UTC().Add(-40 * 24 * time.Hour)
+	for _, c := range []struct {
+		status  string
+		updated time.Time
+	}{
+		{"success", old}, {"failed", old}, {"pending", old}, {"success", time.Now().UTC()},
+	} {
+		if _, err := st.DB.Exec(`INSERT INTO webhook_deliveries
+			(webhook_id, message_id, status, attempts, created_at, updated_at) VALUES (?,?,?,0,?,?)`,
+			whID, msgs[0].ID, c.status, c.updated, c.updated); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	Once(context.Background(), cfg, st)
+
+	rest, total, err := st.ListDeliveries(store.DeliveryFilter{})
+	if err != nil || total != 2 {
+		t.Fatalf("应只剩 2 条（旧的 pending + 新的 success），得 total=%d err=%v", total, err)
+	}
+	for _, d := range rest {
+		if d.Status == "failed" || (d.Status == "success" && !d.UpdatedAt.After(old.Add(time.Hour))) {
+			t.Errorf("超期的终态记录应被清理，得 %+v", d)
+		}
+	}
+}

@@ -71,7 +71,7 @@ curl -H "Authorization: Bearer $MAILHUB_API_TOKEN" \
 
 ## API 概览
 
-认证：`Authorization: Bearer <MAILHUB_API_TOKEN>`（SSE 端点用 `?token=`）。
+认证：`Authorization: Bearer <MAILHUB_API_TOKEN>`。例外是 SSE 端点（浏览器的 EventSource 带不了请求头）：先用 `POST /api/v1/events/ticket` 换一张 60 秒有效、只能用一次的票据，再连 `GET /api/v1/events?ticket=…`（兼容旧的 `?token=`，但会把主令牌暴露在代理访问日志里）。
 
 - `GET /healthz` 健康检查（无认证）；`GET /api/v1/status` 服务总览
 - 账号：增删改查、批量导入、手动收取（单/批）、令牌重新授权、启停

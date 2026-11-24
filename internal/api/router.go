@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -67,12 +68,7 @@ func (s *Server) Handler() http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 	r.Use(s.logger)
-	r.Use(func(next http.Handler) http.Handler { // 附件/原始邮件按声明类型处理，禁止浏览器嗅探
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("X-Content-Type-Options", "nosniff")
-			next.ServeHTTP(w, r)
-		})
-	})
+	r.Use(securityHeaders)
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -96,6 +92,31 @@ func (s *Server) Handler() http.Handler {
 		r.Handle("/*", fileServer)
 	}
 	return r
+}
+
+// securityHeaders 所有响应（API、SSE、Web 静态页、附件下载）统一带上的安全头。
+//
+// CSP 只列不会误伤自身页面的指令，不设 default-src / script-src：Naive UI 在运行时注入
+// <style>，邮件正文 iframe 按需加载远程图片，收紧脚本与图片来源需要逐项在浏览器里验证。
+// 即使如此这四条也有实际作用——srcdoc iframe（邮件正文）会继承父文档的 CSP：
+//   - object-src 'none'：邮件里的 <object>/<embed> 一律不加载；
+//   - base-uri 'self'：<base href="//evil/"> 改不了相对地址的基准；
+//   - form-action 'self'：邮件正文里的表单不能把输入提交到外站；
+//   - frame-ancestors 'none'：页面不能被别的站点嵌入（X-Frame-Options: DENY 的现代写法）。
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff") // 附件/原始邮件按声明类型处理，禁止浏览器嗅探
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy",
+			"object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isUniqueViolation 是否为 UNIQUE 约束冲突（驱动错误文本；目前只有 SQLite 方言）。
+func isUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 func (s *Server) logger(next http.Handler) http.Handler {

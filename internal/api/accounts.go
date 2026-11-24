@@ -67,6 +67,7 @@ func (s *Server) mountAccounts(r chi.Router) {
 	r.Delete("/accounts/{id}", s.handleAccountDelete)
 	r.Post("/accounts/{id}/sync", s.handleAccountSync)
 	r.Post("/accounts/{id}/reauth", s.handleAccountReauth)
+	r.Get("/accounts/{id}/reauth-url", s.handleAccountReauthURL)
 	r.Get("/tags", s.handleTagList)
 }
 
@@ -180,6 +181,7 @@ func (s *Server) statsFor(ids []int64) map[int64]stats {
 // ---- handlers ----
 
 // handleAccountCreate 单个添加：先同步验证 IMAP 登录，失败 400（DESIGN.md 6.2）。
+// 邮箱已存在返回 409，且不再做登录验证——没必要为一条注定被拒的请求再去登一次远端邮箱。
 func (s *Server) handleAccountCreate(w http.ResponseWriter, r *http.Request) {
 	var req accountReq
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
@@ -191,6 +193,13 @@ func (s *Server) handleAccountCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_account", err.Error())
 		return
 	}
+	if _, err := s.store.GetAccountByEmail(acct.Email); err == nil {
+		writeErr(w, http.StatusConflict, "account_exists", "该邮箱已存在")
+		return
+	} else if !errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusInternalServerError, "create_failed", err.Error())
+		return
+	}
 	if err := s.verifyAccount(acct, cred); err != nil {
 		writeErr(w, http.StatusBadRequest, "verify_failed",
 			"登录验证失败（"+acct.Transport+"）: "+err.Error())
@@ -198,6 +207,10 @@ func (s *Server) handleAccountCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := s.store.CreateAccount(acct)
 	if err != nil {
+		if isUniqueViolation(err) { // 与并发请求撞车（上面的判重与插入之间）
+			writeErr(w, http.StatusConflict, "account_exists", "该邮箱已存在")
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "create_failed", err.Error())
 		return
 	}
@@ -560,6 +573,18 @@ func (s *Server) handleAccountPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_account", errPollInterval.Error())
 		return
 	}
+	// 凭据字段"传了但为空串"几乎总是前端/脚本的失误（把"留空 = 不修改"原样发了上来）；
+	// 照做会把凭据覆盖成空，账号随即 auth_failed。省略字段才表示不修改。
+	for _, c := range []struct {
+		name string
+		v    *string
+	}{{"password", body.Password}, {"refresh_token", body.RefreshToken}, {"client_id", body.ClientID}} {
+		if c.v != nil && *c.v == "" {
+			writeErr(w, http.StatusBadRequest, "invalid_account",
+				c.name+" 不能为空字符串（不修改请省略该字段）")
+			return
+		}
+	}
 
 	p := store.AccountPatch{
 		Name: body.Name, IMAPHost: body.IMAPHost, Username: body.Username,
@@ -630,10 +655,55 @@ func (s *Server) handleAccountPatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.accountResp(a, s.statsFor([]int64{id})[id]).withTags(tags))
 }
 
+// reauthScope 重新获取令牌用的 scope：按传输分流（Graph 是 Outlook 家族主传输，TECH.md §2）。
+func reauthScope(a *store.Account) string {
+	if a.Transport == "graph" {
+		return mstoken.GraphScope
+	}
+	return mstoken.IMAPScope
+}
+
+// handleAccountReauthURL GET /accounts/{id}/reauth-url：授权页地址（带 login_hint 预填目标邮箱、
+// scope 含 openid）。前端不自己拼这个地址：scope 与 openid 的组合只在这里维护一份，
+// 与兑换端点（handleAccountReauth）严格一致——两边不一致的话令牌端点不返回 id_token。
+func (s *Server) handleAccountReauthURL(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "bad_id", "无效的账号 id")
+		return
+	}
+	a, err := s.store.GetAccount(id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "account_not_found", "账号不存在")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "get_failed", err.Error())
+		return
+	}
+	if a.AuthType != "oauth2" || a.ClientID == "" {
+		writeErr(w, http.StatusBadRequest, "not_oauth2", "仅 OAuth2（令牌）账号支持重新获取令牌")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"url": mstoken.AuthorizeURL(a.ClientID, mstoken.MSNativeRedirect, reauthScope(a), a.Email)})
+}
+
+// maskEmail 邮箱本地部分打码（m***@outlook.com）：错误信息要提示"登成了哪个账号"才好排错，
+// 但不把完整地址写进响应和日志。
+func maskEmail(email string) string {
+	at := strings.LastIndex(email, "@")
+	if at <= 0 {
+		return "***"
+	}
+	return email[:1] + "***" + email[at:]
+}
+
 // handleAccountReauth 重新获取令牌（M4，授权码流）：refresh_token 过期/失效的 Outlook 账号，
 // 用户在浏览器完成 Microsoft 授权登录后把跳转 URL（含 code）粘回，兑换全新 refresh_token，
-// 加密持久化并立即重启 worker 重试。注：密码换令牌（ROPC）已被 Microsoft 对个人账户
-// 禁用（AADSTS9001023），授权码流是 MSA 账号的可行路径；code 一次性、约 10 分钟有效。
+// **校验登录身份确为目标邮箱**，加密持久化并立即重启 worker 重试。
+// 注：密码换令牌（ROPC）已被 Microsoft 对个人账户禁用（AADSTS9001023），
+// 授权码流是 MSA 账号的可行路径；code 一次性、约 10 分钟有效。
 func (s *Server) handleAccountReauth(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
@@ -666,17 +736,30 @@ func (s *Server) handleAccountReauth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// scope 按传输分流：Graph 是 Outlook 家族主传输（TECH.md §2）
-	scope := mstoken.IMAPScope
-	if a.Transport == "graph" {
-		scope = mstoken.GraphScope
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	newRefresh, err := s.reauth.FetchByAuthCode(ctx, code, a.ClientID, mstoken.MSNativeRedirect, scope)
+	newRefresh, idToken, err := s.reauth.FetchByAuthCode(ctx, code, a.ClientID, mstoken.MSNativeRedirect,
+		reauthScope(a))
 	if err != nil {
 		slog.Warn("reauth failed", "account_id", id, "error", err) // 只记事件与错误，不记 code
 		writeErr(w, http.StatusBadRequest, "reauth_failed", err.Error())
+		return
+	}
+	// 校验登录身份。授权页带了 login_hint，但浏览器里往往还登着别的 Microsoft 账号，点一下
+	// "接受"换来的可能就是别人的令牌——不拦的话它会被写进这个账号：本账号从此 auth_failed，
+	// 而原令牌可能已经因为轮换作废了。拿不到身份信息同样拒绝（不能"验不出来就算通过"）。
+	who, err := mstoken.IdentityFromIDToken(idToken)
+	if err != nil {
+		slog.Warn("reauth identity unavailable", "account_id", id, "error", err)
+		writeErr(w, http.StatusBadRequest, "identity_unverified",
+			"无法确认登录的账号（"+err.Error()+"），凭据未修改。请重新打开授权页，用目标邮箱登录")
+		return
+	}
+	if !who.Matches(a.Email) {
+		slog.Warn("reauth rejected: signed-in account mismatch", "account_id", id) // 不记登录的是哪个邮箱
+		writeErr(w, http.StatusBadRequest, "account_mismatch",
+			"登录的账号（"+maskEmail(who.String())+"）与目标账号（"+a.Email+"）不一致，凭据未修改。"+
+				"请重新打开授权页，用目标邮箱登录（浏览器里登着别的账号时，建议用无痕窗口）")
 		return
 	}
 	enc, err := s.cipher.Encrypt([]byte(newRefresh))
@@ -742,6 +825,10 @@ func (s *Server) handleAccountBatchPatch(w http.ResponseWriter, r *http.Request)
 }
 
 // handleAccountDelete 删除账号；purge=true 时先取 raw_path 再删行，最后清磁盘（DESIGN.md 6.2）。
+//
+// 不带 purge 时磁盘上的 .eml 并不会保留：邮件记录随账号级联删除，这些文件失去引用，
+// 下一轮每日维护会把它们当孤儿回收（maintain.orphanEmlGrace 之后）。purge 只决定"现在删"
+// 还是"稍后自动删"。
 func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
@@ -755,6 +842,10 @@ func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	s.manager.RemoveAccount(id)
 	if err := s.store.DeleteAccount(id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "account_not_found", "账号不存在")
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "delete_failed", err.Error())
 		return
 	}

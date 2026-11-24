@@ -7,6 +7,10 @@ services:
     build: .
     image: mailhub:latest
     restart: unless-stopped
+    # 停止宽限期要盖住服务的停机预算：先停 HTTP（≤5s，SSE 长连接会被立即结束），再等
+    # worker/投递器/维护收尾（≤20s）。docker 默认只给 10s，超时即 SIGKILL：IMAP 的 IDLE
+    # 收尾（≤10s）加 LOGOUT（≤5s）可能来不及走完，连接是被硬掐断的。
+    stop_grace_period: 30s
     user: "1000:1000"                # 非 root 运行（镜像不绑定用户；自定义改此处，bind mount 需宿主目录属主匹配）
     ports: ["18099:18099"]
     volumes: ["mailhub-data:/data"]
@@ -16,10 +20,16 @@ services:
       MAILHUB_LISTEN: :18099
       MAILHUB_API_TOKEN: ${MAILHUB_API_TOKEN:?请在 .env 设置}
       MAILHUB_SECRET_KEY: ${MAILHUB_SECRET_KEY:?请在 .env 设置}
+      # TZ: Asia/Shanghai           # 日志时间，以及 API 调用方不传 day_start 时"今日收信"的日界。
+                                     # 省略 = UTC（Web 界面始终按浏览器所在时区算，不受影响）；
+                                     # 镜像自带 tzdata，填 IANA 名称即可。
       # MAILHUB_RETENTION_DAYS: 90   # 0/省略 = 永久保留
       # MAILHUB_IDLE_BUDGET_PER_HOST: 50
 
-  # 可选：矩阵规模建议启用 PostgreSQL（DESIGN.md 9.2）
+  # PostgreSQL：**当前版本尚未接入**。给 mailhub 设置 MAILHUB_DATABASE_URL 会让它启动失败
+  # （store.Open 对非空的库地址直接返回 ErrPostgresNotEnabled）。仓库里有 PostgreSQL 方言的迁移脚本
+  # （internal/store/migrations/*.postgres.sql），但执行器只加载 SQLite 方言，它们从未被执行过；
+  # 接入要做的事见 TECH.md §1.1；下面是接入后可用的样板。
   # postgres:
   #   image: postgres:17
   #   restart: unless-stopped
@@ -28,7 +38,8 @@ services:
   #     POSTGRES_DB: mailhub
   #     POSTGRES_USER: mailhub
   #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-  # 之后给 mailhub 加：MAILHUB_DATABASE_URL: postgres://mailhub:${POSTGRES_PASSWORD}@postgres/mailhub
+  # 接入后给 mailhub 加：MAILHUB_DATABASE_URL: postgres://mailhub:${POSTGRES_PASSWORD}@postgres/mailhub
 
 volumes:
   mailhub-data:
+  # pg-data:   # 启用上面的 postgres 时一并取消注释

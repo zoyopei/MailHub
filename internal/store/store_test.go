@@ -252,6 +252,58 @@ func TestSetFolderDeltaUpsert(t *testing.T) {
 	}
 }
 
+// 首次同步标记：BeginFolderSync 建行并标记"未完成"，已有行不动；入库与游标推进不改标记；
+// FinishFolderSync 置为完成。没经过 BeginFolderSync 建的行（存量数据、其他路径入库）默认是已完成。
+func TestFolderSyncMarker(t *testing.T) {
+	st := testStore(t)
+	a := mustAccount(t, st, "e@x.com")
+
+	if err := st.BeginFolderSync(a, "INBOX"); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := st.GetFolderState(a, "INBOX")
+	if err != nil || fs == nil {
+		t.Fatalf("应建立游标行: %v %v", fs, err)
+	}
+	if fs.UIDValidity != 0 || fs.LastUID != 0 || fs.LastSeenAt.Valid || fs.DeltaLink != "" || fs.InitialDone {
+		t.Fatalf("新建的行应是全零且标记未完成，得 %+v", fs)
+	}
+
+	// 首次同步进行中：入库与游标推进照常工作，但不改"未完成"标记
+	ingest(t, st, &NewMessage{AccountID: a, Folder: "INBOX", UIDValidity: 7, UID: 3,
+		SeenAt: time.Now().UTC(), RawPath: "p"})
+	if err := st.AdvanceFolderUID(a, "INBOX", 7, 9); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.TouchFolderSeen(a, "INBOX", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if fs, _ = st.GetFolderState(a, "INBOX"); fs.UIDValidity != 7 || fs.LastUID != 9 || fs.InitialDone {
+		t.Fatalf("进行中的首次同步应推进游标但保持未完成，得 %+v", fs)
+	}
+
+	if err := st.FinishFolderSync(a, "INBOX"); err != nil {
+		t.Fatal(err)
+	}
+	if fs, _ = st.GetFolderState(a, "INBOX"); !fs.InitialDone {
+		t.Fatalf("走完后应标记完成，得 %+v", fs)
+	}
+	// 完成之后再 BeginFolderSync：不得改回未完成，也不得清游标
+	if err := st.BeginFolderSync(a, "INBOX"); err != nil {
+		t.Fatal(err)
+	}
+	if fs, _ = st.GetFolderState(a, "INBOX"); !fs.InitialDone || fs.UIDValidity != 7 || fs.LastUID != 9 {
+		t.Fatalf("已完成的不应被改回，得 %+v", fs)
+	}
+
+	// 未经 BeginFolderSync、由入库直接建的行：默认已完成
+	b := mustAccount(t, st, "f@x.com")
+	ingest(t, st, &NewMessage{AccountID: b, Folder: "INBOX", UIDValidity: 1, UID: 1, RawPath: "p"})
+	if fs, _ = st.GetFolderState(b, "INBOX"); fs == nil || !fs.InitialDone {
+		t.Fatalf("入库直接建的行应默认已完成，得 %+v", fs)
+	}
+}
+
 // 排序（M4 邮件页）：time 升/降序按 received_at；account 按账号名（组内时间倒序）；OFFSET 分页。
 func TestMessageSort(t *testing.T) {
 	st := testStore(t)

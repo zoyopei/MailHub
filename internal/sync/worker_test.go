@@ -23,36 +23,52 @@ type fakeClient struct {
 	rotated    string
 	msgs       map[string][]fakeMsg // folder → messages（uid 递增）
 	examineUID uint32
+	lastCursor *store.FolderState // 最近一次 FetchFolder 收到的游标（断言走的是增量还是重扫）
 }
 
 type fakeMsg struct {
-	uid uint32
-	raw []byte
+	uid  uint32
+	seen time.Time // INTERNALDATE；零值 = 服务器未给
+	raw  []byte
+	old  bool // 早于首次同步窗口：首次同步的时间窗搜索带不出它，但它计入"现有最大 UID"
 }
 
 func (f *fakeClient) Connect(_ context.Context, _ string, _ int, _ string, _ mailclient.Credentials) (string, error) {
 	return f.rotated, f.connectErr
 }
 
-// FetchFolder 模拟 IMAP 游标语义：UIDVALIDITY 匹配 → UID > last_uid；否则用 since。
+// FetchFolder 模拟 IMAP 游标语义：UIDVALIDITY 匹配 → UID > last_uid；否则时间窗内的邮件。
+// 游标产出与真实实现（imapclient.FetchFolder）一致：UIDVALIDITY + 本轮最大 UID；
+// 首次同步空结果时为"文件夹里现有邮件的最大 UID"（空文件夹即 0），增量空结果不推进。
 func (f *fakeClient) FetchFolder(_ context.Context, folder string, cursor *store.FolderState, _ time.Time,
 	handle func(mailclient.MsgKey, time.Time, []byte) error) (mailclient.FetchResult, error) {
 	uidv := uint32(1)
 	if f.examineUID != 0 {
 		uidv = f.examineUID
 	}
+	res := mailclient.FetchResult{UIDValidity: uidv}
+	f.lastCursor = cursor
 	var lastUID uint32
-	if cursor != nil && cursor.UIDValidity == uidv {
+	cursorValid := cursor != nil && cursor.UIDValidity == uidv
+	if cursorValid {
 		lastUID = cursor.LastUID
 	}
 	for _, m := range f.msgs[folder] {
-		if m.uid > lastUID {
-			if err := handle(mailclient.MsgKey{UIDValidity: uidv, UID: m.uid}, time.Time{}, m.raw); err != nil {
-				return mailclient.FetchResult{}, err
-			}
+		if cursorValid && m.uid <= lastUID || !cursorValid && m.old {
+			continue
+		}
+		if err := handle(mailclient.MsgKey{UIDValidity: uidv, UID: m.uid}, m.seen, m.raw); err != nil {
+			return mailclient.FetchResult{}, err
+		}
+		res.LastUID = max(res.LastUID, m.uid)
+	}
+	if !cursorValid {
+		// 时间窗之内一封都没有：真实实现再搜一次 UID 1:*，取现有邮件的最大 UID
+		for _, m := range f.msgs[folder] {
+			res.LastUID = max(res.LastUID, m.uid)
 		}
 	}
-	return mailclient.FetchResult{}, nil
+	return res, nil
 }
 func (f *fakeClient) SupportsIdle() bool { return false }
 func (f *fakeClient) Idle(context.Context, time.Duration) (bool, error) {

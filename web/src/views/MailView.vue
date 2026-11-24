@@ -1,13 +1,20 @@
 <script setup lang="ts">
 // 邮件工作区（DESIGN.md 7.1/7.2）：左侧账号栏 + 右侧邮件流 + 详情抽屉。
 // 已读与删除只作用于本地副本，绝不回写邮箱服务器。
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+// 列表的请求参数、原地刷新合并、勾选修剪、滚动锚点等纯逻辑在 lib/maillist.ts（有单测），
+// 邮件正文的预处理在 lib/mailhtml.ts；这里只负责把它们接到响应式状态和真实 DOM 上。
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
   NInput, NButton, NSpace, NSwitch, NTag, NBadge, NDrawer, NDrawerContent, NEmpty,
   NSpin, NText, NTooltip, NSelect, NDatePicker, useMessage, useDialog,
 } from 'naive-ui'
 import { download, fmtSize, relTime, request, openEvents } from '../api'
 import type { Account, Msg, MsgDetail } from '../types'
+import { buildFrameDoc } from '../lib/mailhtml'
+import {
+  anchorDelta, buildListQuery, fetchAllPages, mergeRefreshed, pickAnchors, pruneChecked,
+  refreshLimit, type ListFilter, type RowBox,
+} from '../lib/maillist'
 
 const message = useMessage()
 const dialog = useDialog()
@@ -19,14 +26,19 @@ const totalAccounts = ref(0)
 const selectedAccount = ref<number>(0) // 0 = 全部账号
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 
+// 账号栏要全量：一页最多 200 个，矩阵上千个账号时只取第一页会让后面的账号选不到，
+// "全部账号"的未读合计也只算了前 200 个。逐页取完再整体替换。
+let acctSeq = 0
 async function loadAccounts() {
+  const seq = ++acctSeq
+  const q = accountQ.value.trim()
   try {
-    const q = accountQ.value.trim()
-    const resp = await request<{ total: number; accounts: Account[] }>(
-      'GET', `/api/v1/accounts?limit=200${q ? `&q=${encodeURIComponent(q)}` : ''}`)
+    const resp = await fetchAllPages(page => request<{ total: number; accounts: Account[] }>(
+      'GET', `/api/v1/accounts?limit=200&page=${page}${q ? `&q=${encodeURIComponent(q)}` : ''}`))
+    if (seq !== acctSeq) return // 搜索词又变了，这是旧结果
     accounts.value = resp.accounts
     totalAccounts.value = resp.total
-  } catch (e) { message.error((e as Error).message) }
+  } catch (e) { if (seq === acctSeq) message.error((e as Error).message) }
 }
 
 const totalUnread = computed(() => accounts.value.reduce((s, a) => s + a.unread_count, 0))
@@ -40,6 +52,7 @@ const accountById = computed(() => {
 const state = reactive({
   q: '', onlyUnread: false,
   loading: false, loadingMore: false,
+  refreshing: false, // 原地刷新进行中（不显示遮罩，只用来挡住并发的追加加载）
   msgs: [] as Msg[], hasMore: false, total: 0,
 })
 const selected = ref<MsgDetail | null>(null)
@@ -91,48 +104,123 @@ function startResize(key: 'acct' | 'from' | 'time', e: MouseEvent) {
   e.stopPropagation()
 }
 
-async function loadMessages(reset = true) {
+// ---- 列表加载 ----
+// 请求的先后校验：每次请求自增序号，结果落地前核对——期间又发了新请求（切账号、改筛选、
+// SSE 刷新）就丢弃这次的。否则慢的旧响应会盖掉新响应，页面显示的是上一个筛选条件的数据。
+let listSeq = 0
+// 进行中的列表请求（最新一次）。SSE 的原地刷新要等它落定，否则两者会互相覆盖。
+let inflight: Promise<void> | null = null
+// 组件已卸载：等完进行中的请求后不再碰状态
+let gone = false
+function track(p: Promise<void>): Promise<void> {
+  inflight = p
+  p.then(() => { if (inflight === p) inflight = null }, () => { if (inflight === p) inflight = null })
+  return p
+}
+
+function curFilter(): ListFilter {
+  return {
+    accountId: selectedAccount.value, q: state.q, onlyUnread: state.onlyUnread,
+    tags: tagFilter.value, timeRange: timeRange.value, sort: sortKey.value, order: sortOrder.value,
+  }
+}
+
+async function loadMessages(reset = true): Promise<void> {
+  // 追加加载不并发、不叠加在整体加载或原地刷新上（否则同一页会被拼接两次）
+  if (!reset && (state.loading || state.loadingMore || state.refreshing)) return
+  const seq = ++listSeq
   if (reset) {
     state.loading = true
+    state.refreshing = false // 接管进行中的原地刷新（它的 finally 因序号不符不会再清这个标志）
     state.msgs = []
+    state.hasMore = false
+    // 勾选只对当前可见的列表有效：否则换账号、改筛选后"删除选中"会删掉已经看不见的邮件
+    checked.value = new Set()
   } else {
     state.loadingMore = true
   }
-  try {
-    const p = new URLSearchParams()
-    if (selectedAccount.value) p.set('account_id', String(selectedAccount.value))
-    const q = state.q.trim()
-    if (q) p.set('q', q)
-    if (state.onlyUnread) p.set('is_read', 'false')
-    tagFilter.value.forEach(t => p.append('tag', t))
-    if (timeRange.value) {
-      p.set('since', new Date(timeRange.value[0]).toISOString())
-      p.set('until', new Date(timeRange.value[1]).toISOString())
-    }
-    p.set('limit', '50')
-    if (sortKey.value !== 'default') {
+  const last = state.msgs[state.msgs.length - 1]
+  const page = reset
+    ? { limit: 50 }
+    : sortKey.value !== 'default'
       // 排序模式：后端按列排序 + offset 偏移分页（id 游标仅默认模式有效）
-      p.set('sort', sortKey.value)
-      p.set('order', sortOrder.value)
-      if (!reset) p.set('offset', String(state.msgs.length))
-    } else if (!reset && state.msgs.length) {
-      p.set('before_id', String(state.msgs[state.msgs.length - 1].id))
+      ? { limit: 50, offset: state.msgs.length, noTotal: true }
+      : { limit: 50, beforeId: last?.id, noTotal: true } // 翻页跳过重复 COUNT，沿用首页 total
+  return track((async () => {
+    try {
+      const resp = await request<{ messages: Msg[]; total?: number }>(
+        'GET', `/api/v1/messages?${buildListQuery(curFilter(), page)}`)
+      if (seq !== listSeq) return
+      state.msgs = reset ? resp.messages : state.msgs.concat(resp.messages)
+      if (resp.total !== undefined) state.total = resp.total
+      state.hasMore = resp.messages.length > 0 && state.msgs.length < state.total
+      if (reset && scrollEl.value) scrollEl.value.scrollTop = 0 // 换筛选回到顶部，避免深处误触发连加载
+    } catch (e) {
+      if (seq === listSeq) message.error((e as Error).message)
+    } finally {
+      if (seq === listSeq) { state.loading = false; state.loadingMore = false }
     }
-    if (!reset) p.set('no_total', '1') // 翻页跳过重复 COUNT 全表扫描，沿用首页 total
-    const resp = await request<{ messages: Msg[]; total?: number }>('GET', `/api/v1/messages?${p}`)
-    state.msgs = reset ? resp.messages : state.msgs.concat(resp.messages)
-    if (resp.total !== undefined) state.total = resp.total
-    state.hasMore = resp.messages.length > 0 && state.msgs.length < state.total
-    if (reset && scrollEl.value) scrollEl.value.scrollTop = 0 // 换筛选回到顶部，避免深处误触发连加载
-  } catch (e) { message.error((e as Error).message) }
-  finally { state.loading = false; state.loadingMore = false }
+  })())
+}
+
+// 原地刷新（SSE 新邮件、定时兜底）：只重取已加载的那一段（上限 200 行）并原位替换。
+// 不走整体重置——那会把正在往下翻的用户拉回顶部、清掉勾选。
+async function refreshInPlace(): Promise<void> {
+  while (inflight) await inflight // 等进行中的列表请求落定（它不会 reject）
+  if (gone) return
+  const seq = ++listSeq
+  state.refreshing = true
+  const el = scrollEl.value
+  const limit = refreshLimit(state.msgs.length)
+  const before = state.msgs
+  // 记下视口里第一行的位置，刷新后把它放回原处；原本就在顶部的留在顶部（新邮件就该出现在眼前）
+  const anchors = !el || el.scrollTop <= 0 ? [] : pickAnchors(rowBoxes(), headBottom())
+  return track((async () => {
+    try {
+      const resp = await request<{ messages: Msg[]; total: number }>(
+        'GET', `/api/v1/messages?${buildListQuery(curFilter(), { limit })}`)
+      if (seq !== listSeq) return
+      state.total = resp.total
+      state.hasMore = state.msgs.length > 0 && state.msgs.length < resp.total
+      // 头部没变（新邮件不在当前筛选范围内，或排在已加载段之后）：不动列表，
+      // 免得打断正在进行的勾选和阅读
+      if (resp.messages.length === before.length
+        && resp.messages.every((m, i) => m.id === before[i].id)) return
+      state.msgs = mergeRefreshed(resp.messages, limit, resp.total, before)
+      state.hasMore = state.msgs.length > 0 && state.msgs.length < resp.total
+      checked.value = pruneChecked(checked.value, state.msgs.map(m => m.id))
+      await nextTick() // 等 DOM 按新列表更新完再量位置
+      if (seq !== listSeq || !el) return
+      const delta = anchorDelta(anchors, rowBoxes())
+      if (delta !== null) el.scrollTop += delta
+    } catch (e) {
+      if (seq === listSeq) message.error((e as Error).message)
+    } finally {
+      if (seq === listSeq) state.refreshing = false
+    }
+  })())
+}
+
+// 滚动容器里各行的位置（相对容器顶缘）
+function rowBoxes(): RowBox[] {
+  const el = scrollEl.value
+  if (!el) return []
+  const base = el.getBoundingClientRect().top
+  return Array.from(el.querySelectorAll<HTMLElement>('.msg-row[data-id]'), r => {
+    const b = r.getBoundingClientRect()
+    return { id: Number(r.dataset.id), top: b.top - base, bottom: b.bottom - base }
+  })
+}
+// 吸顶表头的下缘（相对容器顶缘）：被它盖住的行不算"视口里的第一行"
+function headBottom(): number {
+  return scrollEl.value?.querySelector('.msg-head')?.getBoundingClientRect().height ?? 0
 }
 
 // 无限滚动：距底 120px 自动加载下一页（与"加载更多"按钮并存，按钮作兜底）
 const scrollEl = ref<HTMLElement | null>(null)
 function onScroll(e: Event) {
   const el = e.target as HTMLElement
-  if (!state.hasMore || state.loading || state.loadingMore) return
+  if (!state.hasMore || state.loading || state.loadingMore || state.refreshing) return
   if (el.scrollHeight - el.scrollTop - el.clientHeight < 120) loadMessages(false)
 }
 
@@ -166,18 +254,28 @@ function pickAccount(id: number) {
 }
 
 // ---- 详情 ----
+// 先后校验同列表：慢的旧响应不能盖掉后点的邮件——否则抽屉里显示的是上一封，
+// 而被标成已读的也是它。关掉抽屉同样作废进行中的请求（否则它会在关掉之后又把抽屉弹开）。
+let detailSeq = 0
 async function openDetail(m: Msg) {
+  const seq = ++detailSeq
   detailLoading.value = true
   selected.value = null
   showHtml.value = false
   loadImages.value = false
   try {
     const d = await request<MsgDetail>('GET', `/api/v1/messages/${m.id}`)
+    if (seq !== detailSeq) return // 期间又点了别的邮件或关了抽屉
     selected.value = d
     // 打开详情默认标记已读（DESIGN.md 7.1）
     if (!d.is_read) toggleRead(d, true)
-  } catch (e) { message.error((e as Error).message) }
-  finally { detailLoading.value = false }
+  } catch (e) { if (seq === detailSeq) message.error((e as Error).message) }
+  finally { if (seq === detailSeq) detailLoading.value = false }
+}
+function closeDetail() {
+  detailSeq++
+  selected.value = null
+  detailLoading.value = false
 }
 
 async function toggleRead(m: Msg, isRead: boolean) {
@@ -201,9 +299,13 @@ function deleteMessage(m: Msg) {
     onPositiveClick: async () => {
       try {
         await request('DELETE', `/api/v1/messages/${m.id}`)
+        // 删除前发出的列表请求（原地刷新/追加加载）可能把这封邮件带回来：等它落地再移除
+        if (inflight) await inflight
         state.msgs = state.msgs.filter(x => x.id !== m.id)
         if (state.total > 0) state.total--
-        selected.value = null
+        // 已删的邮件不能再留在勾选里（"删除选中"不该带着它）
+        checked.value = pruneChecked(checked.value, state.msgs.map(x => x.id))
+        closeDetail()
         message.success('已删除')
         loadAccounts()
       } catch (e) { message.error((e as Error).message) }
@@ -288,23 +390,12 @@ async function syncAccount() {
 
 // ---- 详情正文渲染 ----
 // HTML 正文放入 sandbox iframe；默认不加载远程图片（防追踪像素，DESIGN.md 7.2）。
-// 未允许加载图片时通过 CSP 彻底阻断一切外部网络请求（含无引号 src、srcset、CSS url() 等）。
+// 预处理（摘除正文里的 meta/base、屏蔽图片时的 src 摘除与占位、始终带 CSP）见 lib/mailhtml.ts：
+// 两种模式都靠 CSP 阻断除图片/样式以外的外部加载——允许加载图片时也不放开脚本、框架和表单。
 const frameDoc = computed(() => {
   const d = selected.value
   if (!d || !d.body_html) return ''
-  let html = d.body_html
-  const csp = loadImages.value
-    ? ''
-    : `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:;">`
-  if (!loadImages.value) {
-    // 摘除图片源并展示占位提示，恢复时用原始 HTML 重建
-    html = html.replace(/<img\b([^>]*)\bsrc\s*=\s*("([^"]*)"|'([^']*)'|[^\s>]+)/gi, '<img$1')
-    html = html.replace(/<img\b([^>]*?)\/?>/gi,
-      (m) => m.replace(/<img\b/i, '<img alt="[图片已屏蔽]"'))
-  }
-  return `<!doctype html><html><head><meta charset="utf-8">${csp}
-<style>body{font-family:inherit;margin:8px;color:#333;word-break:break-word}img{max-width:100%}</style>
-</head><body>${html}</body></html>`
+  return buildFrameDoc(d.body_html, loadImages.value)
 })
 
 function downloadRaw() {
@@ -317,14 +408,15 @@ function downloadAtt(attId: number, filename: string) {
 }
 
 // ---- 生命周期 ----
-// SSE：新邮件到达即时刷新（防抖 500ms 合并连发事件；断线由浏览器自动重连，
-// 15s/30s 定时刷新仍保留作为兜底）
+// SSE：新邮件到达即时刷新——原地刷新列表（保住滚动位置与勾选）+ 重取账号未读数。
+// 防抖 500ms 合并连发事件；断线由浏览器自动重连，另有 60s 定时原地刷新兜底
+// （断线期间到达的邮件不会有事件，只能靠它或手动刷新补上）。
 let es: { close: () => void } | null = null
 let sseTimer: ReturnType<typeof setTimeout> | undefined
 function onSSEMessage(data: string) {
   showNotify(data)
   clearTimeout(sseTimer)
-  sseTimer = setTimeout(() => { loadMessages(); loadAccounts() }, 500)
+  sseTimer = setTimeout(() => { refreshInPlace(); loadAccounts() }, 500)
 }
 
 // ---- 浏览器通知（M4）：新邮件到达且页面在后台时弹出 ----
@@ -368,16 +460,20 @@ function showNotify(data: string) {
 }
 
 let refreshTimer: ReturnType<typeof setInterval> | undefined
+let fallbackTimer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
   loadAccounts()
   loadMessages()
   loadTagOptions()
   es = openEvents(onSSEMessage)
   refreshTimer = setInterval(() => { loadAccounts() }, 30000) // 心跳列定期刷新
+  fallbackTimer = setInterval(() => { refreshInPlace() }, 60000)
 })
 onBeforeUnmount(() => {
+  gone = true
+  listSeq++; detailSeq++ // 作废进行中的请求：结果与报错都不该再落到已经离开的页面上
   es?.close()
-  clearInterval(refreshTimer)
+  clearInterval(refreshTimer); clearInterval(fallbackTimer)
   clearTimeout(searchTimer); clearTimeout(msgTimer); clearTimeout(sseTimer)
 })
 </script>
@@ -468,7 +564,8 @@ onBeforeUnmount(() => {
                 @click.stop @mousedown="startResize('time', $event)" /></span>
             <span class="msg-subject">主题</span>
           </div>
-          <div v-for="m in state.msgs" :key="m.id" class="msg-row"
+          <!-- data-id：原地刷新后按它找回滚动锚点行 -->
+          <div v-for="m in state.msgs" :key="m.id" class="msg-row" :data-id="m.id"
             :class="{ unread: !m.is_read, selected: selected?.id === m.id }"
             @click="openDetail(m)">
             <input type="checkbox" :checked="checked.has(m.id)"
@@ -509,8 +606,7 @@ onBeforeUnmount(() => {
     </section>
 
     <!-- 详情抽屉 -->
-    <n-drawer :show="!!selected" :width="520" placement="right"
-      @update:show="(v: boolean) => { if (!v) selected = null }">
+    <n-drawer :show="!!selected" :width="520" placement="right" @update:show="(v: boolean) => { if (!v) closeDetail() }">
       <n-drawer-content :title="selected?.subject || '(无主题)'" closable>
         <n-spin :show="detailLoading">
           <div v-if="selected" class="detail">

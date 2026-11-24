@@ -113,7 +113,9 @@ function openCfg(a: Account) {
     username: a.username || '', imap_host: a.imap_host || '',
     password: '', client_id: a.client_id || '', refresh_token: '',
   }
+  reauthCode.value = '' // 上一个账号留下的授权码不能带到这里（授权码与账号一一对应）
   showCfg.value = true
+  loadReauthUrl(a)
 }
 
 async function saveCfg() {
@@ -152,21 +154,23 @@ async function saveCfg() {
 // ---- 重新获取令牌（授权码流：浏览器登录 → 粘贴跳转地址 → 兑换全新 refresh_token） ----
 const reauthCode = ref('')
 const reauthing = ref(false)
-const reauthUrl = computed(() => {
-  const a = cfgAcct.value
-  if (!a || a.auth_type !== 'oauth2') return ''
-  const cid = (cfgForm.value.client_id || a.client_id || '').trim()
-  if (!cid) return ''
-  const scope = a.transport === 'graph'
-    ? 'https://graph.microsoft.com/.default offline_access'
-    : 'https://outlook.office365.com/IMAP.AccessAsUser.All offline_access'
-  const p = new URLSearchParams({
-    client_id: cid, response_type: 'code', redirect_uri: redirectURI,
-    scope, response_mode: 'query',
-  })
-  return `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${p}`
-})
-const redirectURI = 'https://login.microsoftonline.com/common/oauth2/nativeclient'
+// 授权页地址由服务端生成（GET /accounts/{id}/reauth-url）：带 login_hint 预填目标邮箱，
+// scope 含 openid，与兑换端点严格一致。前端不自己拼——两边 scope 不一致的话令牌端点
+// 不返回 id_token，兑换时就没法校验登录的到底是不是目标账号。
+// 地址按账号**已保存**的 client_id 生成：改了 client_id 要先保存再重新打开本窗口。
+const reauthUrl = ref('')
+const reauthUrlError = ref('')
+let reauthSeq = 0
+async function loadReauthUrl(a: Account) {
+  const seq = ++reauthSeq
+  reauthUrl.value = ''
+  reauthUrlError.value = ''
+  if (a.auth_type !== 'oauth2') return
+  try {
+    const r = await request<{ url: string }>('GET', `/api/v1/accounts/${a.id}/reauth-url`)
+    if (seq === reauthSeq) reauthUrl.value = r.url
+  } catch (e) { if (seq === reauthSeq) reauthUrlError.value = (e as Error).message } // 期间打开了别的账号的窗口：丢弃
+}
 function openAuthPage() {
   if (reauthUrl.value) window.open(reauthUrl.value, '_blank')
 }
@@ -206,7 +210,8 @@ async function reauthNow() {
 function removeOne(a: Account) {
   dialog.warning({
     title: '删除账号',
-    content: `确定删除 ${a.email}？邮件记录将级联删除。勾选"同时清理 .eml"请使用确认后的清理选项。`,
+    // Web 端固定带 purge=true：邮件记录级联删除，.eml 原文同一次请求里一并清掉
+    content: `确定删除 ${a.email}？它的全部本地邮件记录与 .eml 原文将一并删除，不影响邮箱服务器。`,
     positiveText: '删除', negativeText: '取消',
     onPositiveClick: async () => {
       try {
@@ -236,7 +241,7 @@ function batchRemove() {
   if (checked.value.length === 0) return
   dialog.warning({
     title: '批量删除账号',
-    content: `确定删除选中的 ${checked.value.length} 个账号及其全部本地邮件？`,
+    content: `确定删除选中的 ${checked.value.length} 个账号？它们的全部本地邮件记录与 .eml 原文将一并删除，不影响邮箱服务器。`,
     positiveText: '删除', negativeText: '取消',
     onPositiveClick: async () => {
       for (const id of checked.value) {
@@ -599,6 +604,9 @@ onBeforeUnmount(() => {
                 </n-space>
                 <n-text v-if="reauthUrl" depth="3" size="small" class="auth-url"
                   :title="reauthUrl" @click="copyAuthUrl">{{ reauthUrl }}</n-text>
+                <n-text v-if="reauthUrlError" type="error" size="small">
+                  取不到授权页地址：{{ reauthUrlError }}
+                </n-text>
                 <n-input v-model:value="reauthCode" type="textarea" :rows="2"
                   placeholder="2. 授权完成后浏览器会跳转，把跳转后的完整地址（含 code=…）粘贴到这里" />
                 <n-space align="center" :size="8">

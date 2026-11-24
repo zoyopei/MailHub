@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -75,13 +76,13 @@ func (w *worker) run(ctx context.Context) {
 			return
 		case errors.Is(err, mstoken.ErrReauth) || errors.Is(err, imapclient.ErrAuthFailed):
 			// 认证失败即停（DESIGN.md 3.4）：置 auth_failed，等待用户更新凭据。
-			w.m.store.SetAccountStatus(w.acct.ID, store.StatusAuthFailed, err)
+			w.setStatus(store.StatusAuthFailed, err)
 			slog.Warn("worker auth failed, stopping", "account_id", w.acct.ID, "email", w.acct.Email, "error", err)
 			return
 		case err == nil:
 			backoff = 5 * time.Second
 		default:
-			w.m.store.SetAccountStatus(w.acct.ID, store.StatusError, err)
+			w.setStatus(store.StatusError, err)
 			slog.Warn("worker session failed", "account_id", w.acct.ID, "error", err, "backoff", backoff)
 			select {
 			case <-ctx.Done():
@@ -117,23 +118,13 @@ func (w *worker) session(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if rotated != "" {
-		// 令牌轮换：立即持久化（DESIGN.md 3.5），失败不阻断本次收取（旧令牌仍可用到下次）。
-		if enc, e := w.m.cipher.Encrypt([]byte(rotated)); e == nil {
-			if e := w.m.store.UpdateCredential(w.acct.ID, enc); e != nil {
-				slog.Error("persist rotated refresh token failed", "account_id", w.acct.ID, "error", e)
-			} else {
-				// 内存快照也要更新：下个会话的 credentials() 解密的是 w.acct.CredentialEnc，
-				// 不更新的话它会一直用启动时的旧令牌——TokenCache 里存的是服务端返回的新
-				// 令牌，两者对不上，缓存永不命中，每个轮询周期都会再打一次令牌端点。
-				w.acct.CredentialEnc = enc
-				slog.Info("refresh token rotated", "account_id", w.acct.ID)
-			}
-		}
-	}
 	defer cl.Logout()
+	// 会话途中轮换的令牌（mailclient.SessionTokenRotator）：defer 放在成功/失败两条路径上都取走——
+	// 端点已经把新令牌发下来了，不存就丢了（旧令牌随时可能失效）。
+	defer w.takeSessionRotation(cl)
+	w.saveRotated(rotated)
 
-	w.m.store.SetAccountStatus(w.acct.ID, store.StatusSyncing, nil)
+	w.setStatus(store.StatusSyncing, nil)
 
 	// IDLE 准入：服务器支持 + 单文件夹（默认 INBOX；多文件夹配置退回轮询，
 	// DESIGN.md 3.1 连接是稀缺资源）+ 单主机预算内（2.2，超预算降级轮询）。
@@ -142,6 +133,38 @@ func (w *worker) session(ctx context.Context) error {
 		return w.idleLoop(ctx, cl)
 	}
 	return w.pollOnce(ctx, cl)
+}
+
+// saveRotated 持久化轮换后的 refresh_token（DESIGN.md 3.5）。失败只记日志，不阻断本次收取
+// （旧令牌通常还能用到下次）。
+func (w *worker) saveRotated(rt string) {
+	if rt == "" {
+		return
+	}
+	enc, err := w.m.cipher.Encrypt([]byte(rt))
+	if err != nil {
+		slog.Error("encrypt rotated refresh token failed", "account_id", w.acct.ID, "error", err)
+		return
+	}
+	if err := w.m.store.UpdateCredential(w.acct.ID, enc); err != nil {
+		slog.Error("persist rotated refresh token failed", "account_id", w.acct.ID, "error", err)
+		return
+	}
+	// 内存快照也要更新：下个会话的 credentials() 解密的是 w.acct.CredentialEnc，
+	// 不更新的话它会一直用启动时的旧令牌——TokenCache 里存的是服务端返回的新
+	// 令牌，两者对不上，缓存永不命中，每个轮询周期都会再打一次令牌端点。
+	w.acct.CredentialEnc = enc
+	slog.Info("refresh token rotated", "account_id", w.acct.ID)
+}
+
+// takeSessionRotation 取走会话**途中**轮换出的令牌并持久化；传输不支持（没有实现
+// mailclient.SessionTokenRotator）或没有轮换时无事发生。
+func (w *worker) takeSessionRotation(cl mailclient.MailClient) {
+	r, ok := cl.(mailclient.SessionTokenRotator)
+	if !ok {
+		return
+	}
+	w.saveRotated(r.TakeRotatedToken())
 }
 
 // canIdle 判定并占用预算（占用成功即由 session 负责 Release）。
@@ -164,7 +187,7 @@ func (w *worker) idleLoop(ctx context.Context, cl mailclient.MailClient) error {
 	slog.Info("worker in IDLE mode", "account_id", w.acct.ID, "email", w.acct.Email)
 
 	for {
-		w.m.store.SetAccountStatus(w.acct.ID, store.StatusIdle, nil)
+		w.setStatus(store.StatusIdle, nil)
 		// 兜底间隔取全局配置（DB 覆盖 > env），每轮 IDLE 循环读取：保存后下一轮兜底即生效。
 		fallback := time.Duration(w.m.settingInt(store.SettingFallbackInterval, w.m.cfg.FallbackInterval)) * time.Second
 		if fallback < 30*time.Second {
@@ -229,32 +252,83 @@ func (w *worker) pollOnce(ctx context.Context, cl mailclient.MailClient) error {
 	// 心跳：一次成功完成的收件检查即更新，无论有无新邮件（DESIGN.md 3.2）。
 	if err := w.m.store.TouchAccount(w.acct.ID); err != nil {
 		slog.Error("touch heartbeat failed", "account_id", w.acct.ID, "error", err)
+	} else {
+		// 快照跟着更新：UIDVALIDITY 重拉时用它区分"旧邮件换了坐标"和"真正的新邮件"
+		// （见 syncedBefore）。w.acct 是 worker 启动时的快照，不更新的话 IDLE 会话里它
+		// 一直停在启动那一刻，跑得越久偏得越早。只在本 goroutine 上读写，无并发问题。
+		w.acct.LastSyncAt = sql.NullTime{Time: time.Now(), Valid: true}
 	}
-	w.m.store.SetAccountStatus(w.acct.ID, store.StatusPolling, nil)
+	w.setStatus(store.StatusPolling, nil)
 	return nil
+}
+
+// reindexGrace UIDVALIDITY 重拉时判定"旧邮件"的时间余量。
+//
+// 重拉的邮件是否早于上次成功同步，比较的是 INTERNALDATE（**邮件服务器**的时钟）和
+// last_sync_at（**本机**时钟）。两边的钟不一定对得准，而判错的后果并不对称：
+//   - 把旧邮件判成新邮件：最多让一封已被本地删除的旧邮件重新出现并通知一次；
+//   - 把新邮件判成旧邮件：真正的新邮件不投递、不推事件——对靠 webhook 取验证码的
+//     调用方来说就是丢了一封邮件。
+//
+// 所以距上次同步不到 reindexGrace 的邮件一律按新邮件处理。
+const reindexGrace = 10 * time.Minute
+
+// syncedBefore 重拉的邮件是否在上次成功同步之前就到达了（即以前一定收过）。
+// 任一时刻未知时返回 false（按新邮件处理，理由见 reindexGrace）。
+func (w *worker) syncedBefore(arrived time.Time) bool {
+	if arrived.IsZero() || !w.acct.LastSyncAt.Valid {
+		return false
+	}
+	return !arrived.After(w.acct.LastSyncAt.Time.Add(-reindexGrace))
 }
 
 // fetchFolder 增量拉取一个文件夹，IMAP/Graph 统一路径：
 // 游标由 client 实现解释（IMAP：UIDVALIDITY/last_uid；Graph：last_seen_at），
-// worker 只提供初始窗口（首次同步 7 天）与入库回调；Graph 路径在完整拉取后
-// 推进 last_seen_at 游标（失败不推进，重拉靠 graph_id 幂等）。
-// firstSync：无游标即首次添加账号——该批邮件为历史邮件，不触发 webhook（DESIGN 3.4/5.1）。
+// worker 只提供初始窗口与入库回调；Graph 路径在完整拉取后推进 last_seen_at 游标
+// （失败不推进，重拉靠 graph_id 幂等）。
+//
+// 哪些邮件算"历史邮件"（不触发 webhook、不推浏览器事件，DESIGN 3.4/5.1）：
+//   - 首次同步：该文件夹的首次同步还没走完，这一批都是添加账号之前就在的邮件。以
+//     folder_states.initial_done 为准（见 store.BeginFolderSync），而不是"有没有游标行"——
+//     首次同步中途被打断（网络错误、停机、Graph 单轮分页上限）之后接着走的那几轮，
+//     仍然算首次同步；
+//   - UIDVALIDITY 变化后的重拉（仅 IMAP）：邮箱重建了 UID，窗口内的旧邮件换了坐标再出现一遍。
+//     其中上次成功同步之前就到达的，肯定早就收过（本地没有只是因为被删过，或已被
+//     retention 清理），同样按历史处理——否则一次 UID 重建就是一轮通知轰炸。
+//     之后到达的才是真正的新邮件，照常通知（判定见 syncedBefore）。
 func (w *worker) fetchFolder(ctx context.Context, cl mailclient.MailClient, folder string) error {
 	st, err := w.m.store.GetFolderState(w.acct.ID, folder)
 	if err != nil {
 		return err
 	}
-	firstSync := st == nil
+	firstSync := st == nil || !st.InitialDone
+	if st == nil {
+		// 先落"首次同步进行中"的行再开始收：本轮收到的第一封邮件入库时就会建游标行，
+		// 不先标记的话，本轮中途中断后下一轮就不再算首次同步了。
+		if err := w.m.store.BeginFolderSync(w.acct.ID, folder); err != nil {
+			return err
+		}
+	}
 	// 初始窗口恒传：client 在游标有效时忽略它（IMAP UIDVALIDITY 变化时启用）。
 	since := time.Now().Add(-w.initialSyncWindow())
 	res, err := cl.FetchFolder(ctx, folder, st, since, func(key mailclient.MsgKey, seenAt time.Time, raw []byte) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return w.ingest(folder, key, seenAt, raw, firstSync)
+		reindex := st != nil && key.UIDValidity != 0 && key.UIDValidity != st.UIDValidity
+		return w.ingest(folder, key, seenAt, raw, firstSync, reindex)
 	})
 	if err != nil {
 		return err
+	}
+	// IMAP：一轮完整拉取成功后推进 UID 游标。一封都没入库时也必须做——空文件夹的首次同步、
+	// 以及重拉的全部是已存在邮件的情况，游标不建立/不换新的话下一轮还会从头再来
+	// （前者让之后的第一封新邮件仍被当成历史邮件，后者每轮全量重拉）。
+	// 同一 UIDVALIDITY 下游标只增不减；UIDVALIDITY 变化时以本轮为准（见 store.AdvanceFolderUID）。
+	if res.UIDValidity != 0 {
+		if err := w.m.store.AdvanceFolderUID(w.acct.ID, folder, res.UIDValidity, res.LastUID); err != nil {
+			return err
+		}
 	}
 	if !res.LatestSeen.IsZero() {
 		if err := w.m.store.TouchFolderSeen(w.acct.ID, folder, res.LatestSeen); err != nil {
@@ -262,17 +336,37 @@ func (w *worker) fetchFolder(ctx context.Context, cl mailclient.MailClient, fold
 		}
 	}
 	if res.DeltaLink != "" {
-		return w.m.store.SetFolderDelta(w.acct.ID, folder, res.DeltaLink)
+		if err := w.m.store.SetFolderDelta(w.acct.ID, folder, res.DeltaLink); err != nil {
+			return err
+		}
+	}
+	// 首次同步这一轮走完了（没走完——传输的单轮分页上限，见 mailclient.FetchResult.More——
+	// 的那一轮不算）：做标记，之后到达的才是新邮件。
+	if firstSync && !res.More {
+		return w.m.store.FinishFolderSync(w.acct.ID, folder)
 	}
 	return nil
+}
+
+// setStatus 写账号状态；失败只记日志。状态是给人看的，写不进去不该让本次收取失败——
+// 那会把一次数据库抖动升级为整个会话失败。但也再不能静默丢弃：写不进去时界面上全是
+// 过时状态，日志里却没有任何痕迹。
+func (w *worker) setStatus(status string, err error) {
+	if e := w.m.store.SetAccountStatus(w.acct.ID, status, err); e != nil {
+		slog.Error("写账号状态失败", "account_id", w.acct.ID, "status", status, "error", e)
+	}
 }
 
 // ingest 单封邮件入库：写 .eml → 事务入库 → 改名定稿（DESIGN.md 3.3）。
 // 文件名用消息坐标：IMAP {uidvalidity}-{uid}.eml；Graph g-{sha256(graph_id) 前 64 位}.eml
 // （32 位哈希在大邮箱下有可观碰撞概率，碰撞会互相覆盖文件），与事务解耦、天然幂等。
-// historical：首次同步的历史邮件，不生成投递记录（DESIGN 3.4/5.1）。
-func (w *worker) ingest(folder string, key mailclient.MsgKey, seenAt time.Time, raw []byte, historical bool) error {
+// historical：历史邮件（首次同步，或 UIDVALIDITY 重拉中早已收过的），不生成投递记录、
+// 不推浏览器事件（DESIGN 3.4/5.1）。reindex：UIDVALIDITY 重拉，入库时另按 Message-ID 去重。
+func (w *worker) ingest(folder string, key mailclient.MsgKey, seenAt time.Time, raw []byte,
+	firstSync, reindex bool) error {
 	p := mailparse.Parse(raw, w.m.cfg.MaxMessageSize)
+	// 历史邮件：首次同步，或重拉中上次成功同步之前就到达的。
+	historical := firstSync || (reindex && w.syncedBefore(seenAt))
 
 	uid := key.UID
 	name := fmt.Sprintf("%d-%d", key.UIDValidity, key.UID)
@@ -329,6 +423,7 @@ func (w *worker) ingest(folder string, key mailclient.MsgKey, seenAt time.Time, 
 		Truncated:      p.Truncated,
 		ParseError:     p.ParseError,
 		RawPath:        rel,
+		Reindex:        reindex,
 		NotifyEnabled:  w.notify.Load() && !historical, // 账号开关 AND 非历史邮件（DESIGN.md 5.1）
 	}
 	for _, a := range p.Attachments {
@@ -339,7 +434,12 @@ func (w *worker) ingest(folder string, key mailclient.MsgKey, seenAt time.Time, 
 
 	msgID, err := w.m.store.IngestMessage(nm)
 	if errors.Is(err, store.ErrDuplicate) {
-		return nil // 已存在：静默跳过（不删 abs，现有记录仍引用它）
+		// 已存在：静默跳过。本次新写的文件要删掉，否则重拉一箱旧邮件会留下一堆孤儿 .eml
+		// 等每日维护来收。入库前就在的那份不动：现有记录引用的正是它（同坐标）。
+		if !existed {
+			_ = os.Remove(abs)
+		}
+		return nil
 	}
 	if err != nil {
 		if !existed {
@@ -359,8 +459,15 @@ func (w *worker) ingest(folder string, key mailclient.MsgKey, seenAt time.Time, 
 			w.m.events.NotifyEvent(string(b))
 		}
 	}
-	slog.Info("message ingested", "account_id", w.acct.ID, "message_id", msgID,
-		"folder", folder, "uid", uid, "subject", p.Subject)
+	// 入库日志不带主题：验证码邮件的主题本身就是验证码，日志不该多一份副本。
+	// （浏览器通知与 webhook 载荷需要主题，那是它们的功能所在。）
+	if historical {
+		slog.Debug("historical message ingested", "account_id", w.acct.ID, "message_id", msgID,
+			"folder", folder, "uid", uid)
+	} else {
+		slog.Info("message ingested", "account_id", w.acct.ID, "message_id", msgID,
+			"folder", folder, "uid", uid)
+	}
 	return nil
 }
 

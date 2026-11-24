@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 应用外壳：登录（API Token）→ 三工作区（邮件 / 账号 / 仪表盘）。
+// 应用外壳：登录（API Token）→ 五个工作区（邮件 / 账号 / Webhook / 仪表盘 / 设置），靠 n-menu 切换。
 import { computed, ref } from 'vue'
 import {
   NConfigProvider, NMessageProvider, NDialogProvider, NLayout, NLayoutHeader, NLayoutContent,

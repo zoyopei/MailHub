@@ -27,6 +27,7 @@ type Hub struct {
 	mu      sync.Mutex
 	subs    map[chan string]struct{}
 	tickets map[string]time.Time // 一次性短票 → 过期时间
+	closed  bool                 // Close 之后不再接受订阅（服务停机中）
 }
 
 // NewHub 构造事件中心。
@@ -35,6 +36,25 @@ func NewHub() *Hub {
 		subs:    map[chan string]struct{}{},
 		tickets: map[string]time.Time{},
 	}
+}
+
+// Close 结束全部 SSE 连接（服务停机时调用，幂等）。
+//
+// http.Server.Shutdown 不主动关闭活动连接，只等它们自然结束——SSE 长连接永不结束，所以
+// 只要有一个开着的 Web 邮件页，Shutdown 就会等到超时（容器的停止宽限期往往比它还短，
+// 结果是被 SIGKILL）。这里关闭订阅 chan，handleEvents 随即返回；之后新建的连接拿到的是
+// 已关闭的订阅，同样立即结束。浏览器会在服务重启后自动重连。
+func (h *Hub) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	h.closed = true
+	for ch := range h.subs {
+		close(ch)
+	}
+	h.subs = map[chan string]struct{}{} // NotifyEvent 只向 map 里的 chan 发送，不会碰已关闭的
 }
 
 // IssueTicket 签发一枚短期一次性 SSE 票据（60s 有效，消费即销毁）。
@@ -97,7 +117,11 @@ func (h *Hub) NotifyEvent(data string) {
 func (h *Hub) subscribe() chan string {
 	ch := make(chan string, 1)
 	h.mu.Lock()
-	h.subs[ch] = struct{}{}
+	if h.closed {
+		close(ch) // 停机中：让 handleEvents 立即返回，不留新的长连接
+	} else {
+		h.subs[ch] = struct{}{}
+	}
 	h.mu.Unlock()
 	return ch
 }
@@ -152,7 +176,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done(): // 客户端断开
 			return
-		case data := <-ch:
+		case data, ok := <-ch:
+			if !ok {
+				return // Hub 已关闭（服务停机）
+			}
 			fmt.Fprintf(w, "event: message.new\ndata: %s\n\n", data)
 			fl.Flush()
 		case <-heartbeat.C: // 注释行保活（防代理空闲断连）

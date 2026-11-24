@@ -79,13 +79,18 @@ type NewMessage struct {
 	// NotifyEnabled：账号快照的提醒开关（DESIGN.md 5.1 第一层过滤）。
 	// 关闭时不生成任何 deliveries 行。
 	NotifyEnabled bool
+
+	// Reindex：UIDVALIDITY 变化后的重拉（仅 IMAP）。邮箱重建了 UID，旧邮件换了坐标再出现
+	// 一遍；此时除坐标外再按 Message-ID 去重（同账号同文件夹已有同一 Message-ID 即视为
+	// 已存在，DESIGN.md 3.4），否则整箱旧邮件会重新入库并触发通知。
+	Reindex bool
 }
 
-// ErrDuplicate 邮件已存在（UNIQUE(account_id, folder, uidvalidity, uid)），幂等跳过。
+// ErrDuplicate 邮件已存在（UNIQUE(account_id, folder, uidvalidity, uid)；重拉时另含 Message-ID），幂等跳过。
 var ErrDuplicate = errors.New("duplicate message")
 
 // IngestMessage 在**一个事务**内完成 DESIGN.md 3.3 的三件事：
-//  1. 插入 messages（唯一约束冲突返回 ErrDuplicate，全部回滚）
+//  1. 插入 messages（唯一约束冲突返回 ErrDuplicate，全部回滚；Reindex 时另按 Message-ID 查重）
 //  2. NotifyEnabled 时为每个匹配 webhook（enabled 且 account_ids 为 NULL 或含本账号）
 //     插入 pending 的 webhook_deliveries（M2 投递器消费；M1 只入队）
 //  3. upsert folder_states：不存在则建（uidvalidity, uid）；uidvalidity 变化则归零重写；
@@ -122,6 +127,20 @@ func (s *Store) IngestMessage(m *NewMessage) (int64, error) {
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
+	}
+	if m.Reindex && m.MessageID != "" {
+		// UIDVALIDITY 变化后的重拉：坐标是新的，要按 Message-ID 才认得出旧邮件。
+		// 走 idx_messages_message_id(account_id, message_id)。没有 Message-ID 的邮件无法识别，
+		// 只能按坐标去重（会重复入库，极少见）。
+		var dup int64
+		err = tx.QueryRow(`SELECT id FROM messages WHERE account_id = ? AND folder = ? AND message_id = ? LIMIT 1`,
+			m.AccountID, m.Folder, m.MessageID).Scan(&dup)
+		if err == nil {
+			return 0, ErrDuplicate
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, err
+		}
 	}
 	if m.GraphID != "" {
 		// graph_id 未入库但哈希 uid 被别的邮件占用 → 碰撞，探测下一个空闲 uid。
@@ -205,10 +224,10 @@ func (s *Store) IngestMessage(m *NewMessage) (int64, error) {
 		if int64(uid) > oldLast {
 			_, err = tx.Exec(`UPDATE folder_states SET last_uid = ?, last_seen_at = ?
 				WHERE account_id = ? AND folder = ?`,
-				uid, coalesceNewer(m.SeenAt), m.AccountID, m.Folder)
+				uid, nullTime(m.SeenAt), m.AccountID, m.Folder)
 		} else if !m.SeenAt.IsZero() {
 			_, err = tx.Exec(`UPDATE folder_states SET last_seen_at = ? WHERE account_id = ? AND folder = ?`,
-				coalesceNewer(m.SeenAt), m.AccountID, m.Folder)
+				nullTime(m.SeenAt), m.AccountID, m.Folder)
 		}
 	case err == nil: // UIDVALIDITY 变化：归零重写
 		_, err = tx.Exec(`UPDATE folder_states SET uidvalidity = ?, last_uid = ?, last_seen_at = ?
@@ -272,16 +291,17 @@ type FolderState struct {
 	LastUID     uint32
 	LastSeenAt  sql.NullTime // Graph 路径的时间游标（002 迁移）
 	DeltaLink   string       // Graph delta 增量链接（003 迁移；空 = 无/失效）
+	InitialDone bool         // 首次同步已完整走完（008 迁移）；false = 还没走完，见 BeginFolderSync
 }
 
 func (s *Store) GetFolderState(accountID int64, folder string) (*FolderState, error) {
 	var st FolderState
-	var uidv, last int64
+	var uidv, last, done int64
 	var seen sql.NullTime
 	var delta sql.NullString
-	err := s.DB.QueryRow(`SELECT account_id, folder, uidvalidity, last_uid, last_seen_at, delta_link
+	err := s.DB.QueryRow(`SELECT account_id, folder, uidvalidity, last_uid, last_seen_at, delta_link, initial_done
 		FROM folder_states WHERE account_id = ? AND folder = ?`, accountID, folder).
-		Scan(&st.AccountID, &st.Folder, &uidv, &last, &seen, &delta)
+		Scan(&st.AccountID, &st.Folder, &uidv, &last, &seen, &delta, &done)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -290,6 +310,7 @@ func (s *Store) GetFolderState(accountID int64, folder string) (*FolderState, er
 	}
 	st.UIDValidity, st.LastUID, st.LastSeenAt = uint32(uidv), uint32(last), seen
 	st.DeltaLink = delta.String
+	st.InitialDone = done != 0
 	return &st, nil
 }
 
@@ -304,6 +325,52 @@ func (s *Store) SetFolderDelta(accountID int64, folder string, link string) erro
 		VALUES (?,?,0,0,?)
 		ON CONFLICT (account_id, folder) DO UPDATE SET delta_link = excluded.delta_link`,
 		accountID, folder, link)
+	return err
+}
+
+// AdvanceFolderUID 在一个 IMAP 文件夹**完整**拉取成功后推进游标（worker 调用；lastUID 取本轮
+// 搜索结果的最大 UID，首次同步无结果时取文件夹里现有邮件的最大 UID）。
+//   - 行不存在（空文件夹的首次同步）→ 建立。IngestMessage 只在入库时建行，空文件夹就一直没有
+//     游标：之后到达的第一封邮件仍按"首次同步"处理，被当成历史邮件，不触发 webhook。
+//     对专门收验证码的空邮箱，这正好是最关键的一封。
+//   - UIDVALIDITY 一致 → last_uid 只增不减；
+//   - UIDVALIDITY 变化 → 以本轮为准重写。重拉的全部是已存在邮件（按 Message-ID 去重）时没有
+//     任何入库，游标必须在这里换新，否则每一轮都重新全量重拉。
+//
+// Graph 文件夹的行 uidvalidity 恒为 0，调用方不要对本函数传 uidv=0。
+func (s *Store) AdvanceFolderUID(accountID int64, folder string, uidv, lastUID uint32) error {
+	if uidv == 0 {
+		return errors.New("AdvanceFolderUID: uidvalidity 不能为 0")
+	}
+	_, err := s.DB.Exec(`INSERT INTO folder_states (account_id, folder, uidvalidity, last_uid)
+		VALUES (?,?,?,?)
+		ON CONFLICT (account_id, folder) DO UPDATE SET
+			uidvalidity = excluded.uidvalidity,
+			last_uid = CASE WHEN folder_states.uidvalidity = excluded.uidvalidity
+				THEN MAX(folder_states.last_uid, excluded.last_uid) ELSE excluded.last_uid END`,
+		accountID, folder, uidv, lastUID)
+	return err
+}
+
+// BeginFolderSync 标记"这个文件夹的首次同步开始了"：还没有游标行时建一个全零行并置
+// initial_done = 0；已有行则什么都不动。worker 在首次同步**开始之前**调用，走完之后调
+// FinishFolderSync。
+//
+// 为什么需要标记："哪些邮件是历史邮件"（不触发 webhook、不推浏览器事件，DESIGN 3.4/5.1）
+// 取决于该文件夹的首次同步是否已经完整走完，而不是有没有游标行——游标行在首封邮件入库时
+// 就建了。只看行的话，首次同步中途被打断（网络错误、停机、Graph 单轮分页上限）之后，
+// 下一轮就不再算"首次同步"，窗口里剩下的历史邮件全被当成新邮件通知。
+func (s *Store) BeginFolderSync(accountID int64, folder string) error {
+	_, err := s.DB.Exec(`INSERT INTO folder_states (account_id, folder, uidvalidity, last_uid, initial_done)
+		VALUES (?,?,0,0,0)
+		ON CONFLICT (account_id, folder) DO NOTHING`, accountID, folder)
+	return err
+}
+
+// FinishFolderSync 首次同步完整走完：置 initial_done = 1，之后到达的邮件都是新邮件。
+func (s *Store) FinishFolderSync(accountID int64, folder string) error {
+	_, err := s.DB.Exec(`UPDATE folder_states SET initial_done = 1
+		WHERE account_id = ? AND folder = ?`, accountID, folder)
 	return err
 }
 
@@ -369,9 +436,6 @@ func nullTime(t time.Time) any {
 	}
 	return t.UTC()
 }
-
-// coalesceNewer：SeenAt 非零才写（SQL 参数化直接传值；UPDATE 未带 CASE，直接覆盖为较新值由调用侧保证）。
-func coalesceNewer(t time.Time) any { return nullTime(t) }
 
 // MessageFilter 列表筛选（DESIGN.md 6.3 查询参数）。
 type MessageFilter struct {
@@ -751,11 +815,11 @@ func (s *Store) AllRawPaths() (map[string]struct{}, error) {
 	return out, rows.Err()
 }
 
-// TodayMessageCount 今日收信数（/status）。
-func (s *Store) TodayMessageCount() (int, error) {
-	cutoff := time.Now().UTC().Truncate(24 * time.Hour)
+// MessageCountSince 自 since 起的收信数（/status 的"今日收信"；日界由调用方决定——
+// 默认取服务器本地零点，Web 端传浏览器所在时区的零点）。走 idx_messages_received。
+func (s *Store) MessageCountSince(since time.Time) (int, error) {
 	var n int
-	err := s.DB.QueryRow(`SELECT COUNT(*) FROM messages WHERE received_at >= ?`, cutoff).Scan(&n)
+	err := s.DB.QueryRow(`SELECT COUNT(*) FROM messages WHERE received_at >= ?`, since.UTC()).Scan(&n)
 	return n, err
 }
 

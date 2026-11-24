@@ -1,8 +1,9 @@
-// Package maintain 每日维护任务（TECH.md §4）：retention 清理与孤儿 .eml 回收。
+// Package maintain 每日维护任务（TECH.md §2.10）：retention 清理、孤儿 .eml 回收与投递记录清理。
 //   - retention（DESIGN.md 9.1 MAILHUB_RETENTION_DAYS，0 = 永久）：
 //     删除 received_at 早于保留窗口的邮件（行 + 级联附件/投递记录 + .eml 文件）；
 //   - 孤儿回收（DESIGN.md 6.2 batch-delete 的兜底）：删除 mails/ 下未被数据库
-//     引用的 .eml（异步文件删除失败的遗留）与超过 24h 的 .part 写入残留。
+//     引用的 .eml（异步文件删除失败的遗留）与超过 24h 的 .part 写入残留；
+//   - 投递记录（DESIGN 5.3）：终态记录保留 30 天。
 package maintain
 
 import (
@@ -25,6 +26,9 @@ const stalePartAge = 24 * time.Hour
 // orphanEmlGrace 未引用 .eml 的回收宽限期：worker 先定稿 .eml 再提交事务，
 // 若维护恰好在两步之间扫描，跳过刚写入的文件防止误删。
 const orphanEmlGrace = 5 * time.Minute
+
+// deliveryKeep 终态投递记录的保留期（DESIGN 5.3）。
+const deliveryKeep = 30 * 24 * time.Hour
 
 // Run 阻塞执行每日维护：启动即跑一轮（错开 1 分钟，避免与启动峰值重叠），
 // 此后每 24 小时一轮，直至 ctx 取消。
@@ -68,6 +72,14 @@ func Once(ctx context.Context, cfg *config.Config, st *store.Store) {
 	// 2. 孤儿回收（retention 之后执行：先删行再扫文件，避免误删本轮已引用文件）
 	if err := sweepOrphans(ctx, cfg, st); err != nil {
 		slog.Error("孤儿文件回收失败", "error", err)
+	}
+
+	// 3. 投递记录清理（终态记录保留 30 天）。原先挂在投递器自己的 6 小时定时器上，与其余
+	// 清理分属两处；并入这里之后"按时间清理"只有每日维护一个入口，也和 retention 同一轮做。
+	if n, err := st.CleanOldDeliveries(deliveryKeep); err != nil {
+		slog.Error("投递记录清理失败", "error", err)
+	} else if n > 0 {
+		slog.Info("投递记录清理完成", "deleted", n)
 	}
 }
 

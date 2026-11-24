@@ -80,7 +80,8 @@ func run() error {
 
 	// Webhook 投递器（DESIGN 5）：入库即 Wake，至少一次投递 + 重试。
 	deliverer := notify.New(cfg, st)
-	// SSE 事件中心（M4）：新邮件入库 → 浏览器即时刷新；与投递器并列被 Wake。
+	// SSE 事件中心（M4）：非历史的新邮件入库 → 推单封摘要给浏览器（刷新列表 / 桌面通知）。
+	// 与投递器的 Wake 信号是两条通道：投递器只要"有活干了"，事件需要载荷。
 	hub := api.NewHub()
 
 	// M2：notify.Deliverer 在此启动并注入 Manager（唤醒投递队列）；M1 传 nil（投递记录已入队，仅不投递）。
@@ -102,7 +103,7 @@ func run() error {
 		defer bg.Done()
 		deliverer.Run(ctx)
 	}()
-	// 每日维护：retention 清理 + 孤儿 .eml 回收（DESIGN.md 9.1，TECH.md §4）。
+	// 每日维护：retention 清理 + 孤儿 .eml 回收 + 投递记录清理（DESIGN.md 9.1/5.3，TECH.md §4）。
 	go func() {
 		defer bg.Done()
 		maintain.Run(ctx, cfg, st)
@@ -128,9 +129,7 @@ func run() error {
 		}
 	case <-ctx.Done():
 		slog.Info("shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		shutdownHTTP(srv, hub)
 	}
 
 	stop() // 监听失败路径也要停掉后台任务
@@ -138,10 +137,36 @@ func run() error {
 	go func() { bg.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(30 * time.Second):
-		slog.Warn("后台任务未在 30s 内退出，强制关闭")
+	case <-time.After(bgStopTimeout):
+		slog.Warn("后台任务未在限时内退出，强制关闭", "timeout", bgStopTimeout)
 	}
 	return runErr
+}
+
+// 停机预算。两个阶段加起来要落在容器的停止宽限期之内（docker-compose.yml 的
+// stop_grace_period: 30s；docker 默认只有 10s，超时即 SIGKILL）。
+const (
+	// httpShutdownTimeout 等活动请求结束的上限。SSE 连接由 shutdownHTTP 先行结束，
+	// 所以正常情况下 HTTP 停机是毫秒级的；这个上限只兜"卡住的慢请求"。
+	httpShutdownTimeout = 5 * time.Second
+	// bgStopTimeout 等 worker/投递器/维护退出的上限。IMAP 的 IDLE 收尾（≤10s）与 LOGOUT（≤5s）
+	// 都有上限，看门狗保证 ctx 取消后连接立即断开，正常远用不满。
+	bgStopTimeout = 20 * time.Second
+)
+
+// shutdownHTTP 优雅停机 HTTP：先结束 SSE 长连接，再等其余请求收尾。
+//
+// srv.Shutdown 不主动关闭活动连接，只等它们自然结束——SSE 长连接永不结束。只要有一个开着的
+// Web 邮件页，Shutdown 就会等满超时，而容器的停止宽限期往往比它还短，结果是被 SIGKILL。
+// Hub.Close 让全部 SSE 处理器立即返回（浏览器会在服务重启后自动重连），Shutdown 随即完成。
+func shutdownHTTP(srv *http.Server, hub *api.Hub) {
+	hub.Close()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("http 停机超时，强制关闭剩余连接", "error", err)
+		_ = srv.Close()
+	}
 }
 
 func dbKind(cfg *config.Config) string {

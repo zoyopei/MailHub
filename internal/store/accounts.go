@@ -233,13 +233,23 @@ func (s *Store) ApplyAccountPatch(id int64, p AccountPatch) error {
 	if p.NotifyEnabled != nil {
 		add("notify_enabled", boolInt(*p.NotifyEnabled))
 	}
-	if p.Enabled != nil {
+	// status / last_error 的派生变更：同一列在 SET 里只出现一次，下面的规则按优先级取一条。
+	//   - enabled（无论启停）→ 状态直接落到 pending / disabled；重新启用时清掉上次的报错；
+	//   - 否则若换了凭据 → 仅当处于 auth_failed 时回到 pending（新凭据要重新试），其余状态
+	//     保持（运行中的 worker 自会改写），并清掉上次的报错。
+	// 不这么做的话，界面上会一直挂着"认证失败"和早已过时的错误信息。
+	switch {
+	case p.Enabled != nil:
 		add("enabled", boolInt(*p.Enabled))
+		add("last_error", nil)
 		if *p.Enabled {
 			add("status", StatusPending)
 		} else {
 			add("status", StatusDisabled)
 		}
+	case p.CredentialEnc != nil:
+		add("last_error", nil)
+		sets = append(sets, "status = CASE WHEN status = '"+StatusAuthFailed+"' THEN '"+StatusPending+"' ELSE status END")
 	}
 	args = append(args, id)
 	res, err := s.DB.Exec(`UPDATE accounts SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
@@ -265,21 +275,30 @@ func (s *Store) TouchAccount(id int64) error {
 	return err
 }
 
-// SetAccountStatus 更新状态与错误信息。err 为 nil 时清空 last_error。
-func (s *Store) SetAccountStatus(id int64, status string, accErr error) {
+// SetAccountStatus 更新状态与错误信息。accErr 为 nil 时清空 last_error。写失败会返回错误——
+// 调用方自行决定是否记日志，但不能再静默丢弃：数据库出问题时状态写不进去，界面上看到的
+// 就全是过时状态，日志里却没有任何痕迹。
+func (s *Store) SetAccountStatus(id int64, status string, accErr error) error {
 	var e any
 	if accErr != nil {
-		e = accErr.Error()
+		e = truncateErr(accErr.Error())
 	}
-	s.DB.Exec(`UPDATE accounts SET status = ?, last_error = ? WHERE id = ?`, status, e, id)
+	_, err := s.DB.Exec(`UPDATE accounts SET status = ?, last_error = ? WHERE id = ?`, status, e, id)
+	return err
 }
 
-// DeleteAccount 删除账号（messages/folder_states 经外键 CASCADE 一并删除）。
+// DeleteAccount 删除账号（messages/folder_states 经外键 CASCADE 一并删除）；账号不存在返回 ErrNotFound。
 // purge 语义由调用方实现：purge=true 时先用 ListRawPathsByAccount 取路径，
 // 删除账号后再清理磁盘 .eml（DESIGN.md 6.2）。
 func (s *Store) DeleteAccount(id int64) error {
-	_, err := s.DB.Exec(`DELETE FROM accounts WHERE id = ?`, id)
-	return err
+	res, err := s.DB.Exec(`DELETE FROM accounts WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ListRawPathsByAccount 返回账号全部 .eml 相对路径（purge 时清理磁盘）。

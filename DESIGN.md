@@ -35,7 +35,7 @@ main.py 带来的关键设计输入（均已纳入下文）：
 |---|---|
 | Outlook 已停用基础认证，必须 XOAUTH2 | OAuth2 从"按需"提前到第一期（3.5） |
 | 每个账号使用独立的 client_id（Azure 应用注册） | accounts 表新增 `client_id` 字段（4） |
-| 刷新可能返回新 refresh_token，必须持久化，否则下次可能 invalid_grant | 令牌轮换在同一数据库事务中更新凭据（3.5） |
+| 刷新可能返回新 refresh_token，必须持久化，否则下次可能 invalid_grant | 令牌轮换后立即加密写回凭据（3.5） |
 | Graph 与 IMAP 令牌 audience 不同，互不通用 | 令牌缓存按 scope 参数化，IMAP/Graph 各取所需（3.5、3.6） |
 | `invalid_grant` 表示需要用户重新授权 | 映射为 `auth_failed` 状态并停止重试（3.4） |
 | 账号文件中的密码字段在 XOAUTH2 流程中实际未使用 | oauth2 账号不需要密码，凭据二选一（4） |
@@ -84,9 +84,9 @@ main.py（Python）的价值以**参数与流程**形式移植：token 刷新只
 | 语言 | **Go** | 理由见上表 |
 | IMAP 库 | `emersion/go-imap` v2 | 支持 IDLE 与 XOAUTH2 |
 | 邮件解析 | `jhillyerd/enmime` | 处理 MIME、编码、附件 |
-| 数据库 | **SQLite（WAL）**，可选 PostgreSQL | 低频收件（日增百级～千级、年增百万行内）下 SQLite 覆盖全部规划规模，零运维；DDL 兼容 PostgreSQL，量级显著变化时经 `MAILHUB_DATABASE_URL` 切换，不引入 ORM 重型抽象 |
+| 数据库 | **SQLite（WAL）**，可选 PostgreSQL | 低频收件（日增百级～千级、年增百万行内）下 SQLite 覆盖全部规划规模，零运维；DDL 兼容 PostgreSQL，量级显著变化时经 `MAILHUB_DATABASE_URL` 切换，不引入 ORM 重型抽象。**当前版本 PostgreSQL 尚未接入**：仓库里有 PG 方言的迁移脚本，但执行器只加载 SQLite 方言（它们从未被执行过），驱动也没接——填非空的库地址会让服务启动失败（TECH.md §1.1） |
 | 存储 | 本地磁盘 | 原始邮件存为 `.eml`，数据库只存元数据和正文；低频收件下存储成本极低（9.4），默认永久保留 |
-| 前端 | 轻量 SPA（Vue/React 任选） | 千级账号列表与邮件列表必须**虚拟滚动** + 分页 + 搜索（7） |
+| 前端 | Vue 3 + TypeScript 单页应用（Naive UI） | 千级账号列表与邮件列表必须**分页 + 搜索**，不能靠一次渲染上万行来应付（7）。当前实现：账号管理页是服务端分页表格，邮件流是无限滚动，账号侧栏一次取齐——都**没有做虚拟化**，规模再上一个量级时再引入虚拟列表（TECH 1.2） |
 
 ### 2.2 规模设计考量（几百～上千账号）
 
@@ -114,7 +114,7 @@ main.py（Python）的价值以**参数与流程**形式移植：token 刷新只
 
 ### 3.1 基本原则
 - **只读**：用 `EXAMINE`（而非 `SELECT`）打开文件夹，用 `BODY.PEEK[]` 拉取邮件，不会修改 `\Seen` 等任何标记。（main.py 的 `mark_seen=False` 是同一原则的库层实现。）
-- **增量**：基于 IMAP 的 `UIDVALIDITY` 和 `UID`，每个文件夹记录 `last_uid`，每次只拉 `UID > last_uid` 的邮件。
+- **增量**：基于 IMAP 的 `UIDVALIDITY` 和 `UID`，每个文件夹记录 `last_uid`，每次只拉 `UID > last_uid` 的邮件。实现上发 `UID SEARCH UID n:*`（n = last_uid + 1），但 `n:*` 在 n 大于文件夹里任何 UID 时**仍然匹配最后一封**（RFC 3501），所以客户端要把结果里 `UID ≤ last_uid` 的再滤掉，才算真正"只拉游标之后的"。
 - **默认只同步 INBOX**：每个被监控的文件夹占用一条 IDLE 连接，矩阵规模下连接是稀缺资源，不建议配置额外文件夹。
 
 ### 3.2 Worker 生命周期
@@ -136,10 +136,11 @@ main.py（Python）的价值以**参数与流程**形式移植：token 刷新只
 - **`last_sync_at` 是账号心跳**：任何一次**成功完成**的收件检查（增量拉取往返成功，无论是否拉到新邮件）都更新它；失败的尝试不更新（异常由 `status` / `last_error` 呈现）。IDLE 模式下 5 分钟兜底定时器保证该时间戳持续前进，据此在 Web 端区分"没有邮件"与"收取故障"（7）。
 - 账号被 API 修改、停用或删除时，同步管理器停止旧 worker，再按新配置重启。
 - 重连即重新认证：oauth2 账号每次（重）连接前刷新 access_token（3.5），长连接存续期间无需重复认证。
+- **连接超时**（每个等待都有上限，worker 不会永久卡住）：TCP 连接 30 秒；连上之后持续 **2 分钟**收不到任何数据（服务器卡死，或连接被中间设备静默丢弃）即断开重连，本地入库处理期间不计入；IDLE 收尾（发出 DONE 后等确认）上限 10 秒，LOGOUT 上限 5 秒。停机时正是靠这几条上限保证 worker 在限时内退出（9.2）。
 
 ### 3.3 单封邮件处理流程
 1. `UID FETCH` 拉取完整原始邮件（RFC822）。
-2. 原文写入磁盘：`data/mails/{account_id}/{yyyy-mm}/{uidvalidity}-{uid}.eml`（文件名用 IMAP 坐标而非数据库 id：写盘与事务解耦，天然幂等，无"先拿 id 再改名"的崩溃窗口）。
+2. 原文写入磁盘：`data/mails/{account_id}/{yyyy-mm}/{uidvalidity}-{uid}.eml`（文件名用 IMAP 坐标而非数据库 id：写盘与事务解耦，天然幂等，无"先拿 id 再改名"的崩溃窗口）。先写 `.part` 临时文件、再原子改名定稿，然后才提交事务——不会出现"事务已提交、文件却没写完"。解析失败也照存原文。
 3. 解析出发件人、收件人、主题、日期、纯文本正文、HTML 正文、附件列表。
 4. **在同一个数据库事务内**完成三件事：
    - 插入 `messages` 记录
@@ -152,12 +153,14 @@ main.py（Python）的价值以**参数与流程**形式移植：token 刷新只
 ### 3.4 边界情况
 | 情况 | 处理 |
 |---|---|
-| 首次添加账号 | 默认只拉取最近 `MAILHUB_INITIAL_SYNC_DAYS`（默认 90 天，约 3 个月）的邮件，且**历史邮件不触发 webhook**，避免通知轰炸；批量导入的账号同样按此规则 |
+| 首次添加账号 | 默认只拉取最近 `MAILHUB_INITIAL_SYNC_DAYS`（默认 90 天，约 3 个月）的邮件，且**历史邮件不触发 webhook**，避免通知轰炸；批量导入的账号同样按此规则。"历史与否"以**该文件夹的首次同步是否已完整走完**为准（`folder_states.initial_done`，008 迁移），不以"有没有游标行"为准——游标行在首封邮件入库时就建了。首次同步中途被打断（网络错误、停机、Graph 单轮分页上限）之后接着走的那几轮仍然算首次同步，窗口里剩下的邮件不会被当成新邮件通知；走完之后到达的才是新邮件 |
+| 空文件夹 / 新增文件夹 | 游标行原本只在首封邮件入库时建立，空文件夹于是一直没有游标，之后到达的第一封仍按"首次同步"处理、被当成历史邮件而不通知——对专门收验证码的空邮箱，这正是最关键的一封。现在一轮拉取**完整成功**后即建立游标（`last_uid` 取文件夹里现有邮件的最大 UID，空文件夹为 0），空收件箱、邮件全部早于时间窗、给已有账号新增文件夹都能正确建游标 |
+| `UID n:*` 的边界语义 | RFC 3501 规定 `n:*` 在 n 大于文件夹里任何 UID 时仍匹配最后一封，所以"没有新邮件"时服务器不回空，而是带回游标处那一封。客户端在增量路径滤掉 `UID ≤ last_uid` 的结果（3.1）——否则稳态下每轮都把那封重新全文拉一遍；更糟的是"窗口内一封都没有"时游标取的是现有最大 UID，那封旧邮件从未入库、又不带重拉标记，会被当成**新邮件**入库并通知 |
 | 重复邮件 | IMAP：`(account_id, folder, uidvalidity, uid)` 唯一索引；Graph：`(account_id, graph_id)` 唯一索引（3.6）。重复插入直接忽略 |
-| UIDVALIDITY 变化（少见） | 更新记录并将 `last_uid` 归零，按首次同步规则重拉。已存在的邮件按 `Message-ID` 头去重，不重复通知 |
+| UIDVALIDITY 变化（少见） | 游标按新的 UIDVALIDITY 重建，按首次同步窗口重拉。坐标全变了，唯一索引拦不住重复，入库时另按 `Message-ID` 头去重。其中**上次成功同步之前就到达**的邮件肯定早已收过（本地没有只是因为删过或被 retention 清理），按历史邮件处理、不通知——否则一次 UID 重建就是一轮通知轰炸；之后到达的才是新邮件，照常通知。判定比较的是服务器时钟（INTERNALDATE）与本机 `last_sync_at`，留 10 分钟余量，两边的钟对不准时拿不准的一律按新邮件处理（宁可多通知一封旧的，也不漏掉一封新的） |
 | 超大邮件 | 超过 `max_message_size`（默认 50MB）只保存头部信息，标记 `truncated=true` |
-| 认证失败（密码错误 / `invalid_grant`） | 账号状态置为 `auth_failed` 并**停止重试**（矩阵规模下防风控升级，2.2），等待用户通过 API 更新凭据或重新授权。只有服务器**明确拒绝凭据**才算认证失败；网络断连、服务器无响应、以 `* BYE` 拒绝接入（限流/维护）都属于连接类错误，按退避重连，不会把账号停在 `auth_failed` |
-| 刷新令牌轮换（oauth2） | 刷新接口返回新 refresh_token 时在同一事务中更新 `credential_enc`（3.5）。更新失败不影响本次已获取的 access_token，下次连接前重试 |
+| 认证失败（密码错误 / `invalid_grant`） | 账号状态置为 `auth_failed` 并**停止重试**（矩阵规模下防风控升级，2.2），等待用户通过 API 更新凭据或重新授权。只有服务器**明确拒绝凭据**才算认证失败；网络断连、服务器无响应、以 `* BYE` 拒绝接入（限流/维护）都属于连接类错误，按退避重连，不会把账号停在 `auth_failed`。已知局限：IMAP 登录被 tagged `NO` 拒绝时**一律**算认证失败，不细分 RFC 5530 的临时性响应码（`[UNAVAILABLE]`、`[LIMIT]`、`[INUSE]` 等）——这类拒绝本该按连接类退避重试，是否细分尚未定 |
+| 刷新令牌轮换（oauth2） | 刷新接口返回新 refresh_token 时立即加密写回 `credential_enc`（独立的小事务，不等邮件事务，3.5）。更新失败不影响本次已获取的 access_token，下次连接前重试 |
 | 解析失败 | 原始 `.eml` 照常保存，记录 `parse_error`，仍然发送通知 |
 
 ### 3.5 认证方式
@@ -173,14 +176,14 @@ main.py（Python）的价值以**参数与流程**形式移植：token 刷新只
 | 令牌端点 | `https://login.microsoftonline.com/common/oauth2/v2.0/token`（多租户，公共客户端，无 client_secret） |
 | Scope | `https://outlook.office365.com/IMAP.AccessAsUser.All offline_access` |
 | IMAP 主机 | `outlook.office365.com:993` |
-| 认证方式 | IMAP `AUTHENTICATE XOAUTH2`（go-imap 的 SASL 支持已内置） |
+| 认证方式 | IMAP `AUTHENTICATE XOAUTH2`（go-imap 自带的 SASL 机制只有 PLAIN / OAUTHBEARER，XOAUTH2 在 `imapclient/oauth.go` 自实现） |
 | client_id | **每账号独立**的 Azure 应用注册 ID，存于 accounts 表 `client_id` 字段 |
 
 **令牌生命周期**：
-1. （重）连接 IMAP 前，用 `refresh_token` 换取 `access_token`（约 1 小时有效）。access_token 只在内存中保存，不落库；IDLE 长连接存续期间无需重复认证，重连时再刷新。
-2. 端点可能返回**轮换后的新 refresh_token**（Microsoft 常见行为）：必须立即在数据库事务中重写 `credential_enc`，并同样保持加密。若沿用未持久化的旧令牌，下次刷新可能得到 `invalid_grant`，账号就要重新授权。main.py 的 `--save-token` 机制验证了此流程。
-3. 令牌刷新由该账号的 worker 串行执行（账号级互斥）：一个账号的多条文件夹连接不各自刷新，避免并发轮换导致令牌竞态。
-4. `invalid_grant`（令牌被吊销、过期、用户改密或撤回授权）→ 账号置 `auth_failed` 并停止重试（3.4），提示用户重新授权。
+1. （重）连接 IMAP 前，用 `refresh_token` 换取 `access_token`（约 1 小时有效）。access_token 只在内存中保存，不落库；IDLE 长连接存续期间无需重复认证；重连时直接复用缓存里尚未临近过期的 access_token，临近过期才刷新（见 3）。
+2. 端点可能返回**轮换后的新 refresh_token**（Microsoft 常见行为）：必须立即持久化并同样保持加密。若沿用未持久化的旧令牌，下次刷新可能得到 `invalid_grant`，账号就要重新授权。main.py 的 `--save-token` 机制验证了此流程。轮换可能发生在两个时刻，都要存：连接那一刻（返回值），以及**会话途中**——Graph 一次会话要发很多请求，访问令牌会在途中过期并触发刷新。实现上由传输层把新令牌交给 worker，worker 在会话结束时取走写库（`mailclient.SessionTokenRotator`）；它不属于"入库与通知同一事务"（3.3），是独立的小事务。
+3. 令牌刷新由该账号的 worker 串行执行（账号级互斥）：一个账号的多条文件夹连接不各自刷新，避免并发轮换导致令牌竞态。access_token 进程内缓存（按 scope + 账号 + client_id），过期前 60 秒才再刷新——常驻服务不能像 main.py（短命进程）那样每次连接都刷新。
+4. `invalid_grant`（令牌被吊销、过期、用户改密或撤回授权）→ 账号置 `auth_failed` 并停止重试（3.4），提示用户重新授权。Graph 请求途中遇到 401 不直接算认证失败：先强制刷新一次访问令牌再重试，刷新被明确拒绝才算凭据失效（3.6）。
 5. API 永不返回任何凭据（密码、refresh_token、access_token 均不回显）。
 
 > 注意：Graph 与 IMAP 需要不同 audience 的令牌，互不通用（main.py 中 `GRAPH_SCOPE` 与 `IMAP_SCOPE` 分开定义的原因）。令牌缓存按 scope 参数化：Outlook 家族账号走 Graph 传输时取 Graph scope（3.6），其余 IMAP 账号取 IMAP scope；不为同一传输维护两套令牌。
@@ -198,11 +201,20 @@ main.py（Python）的价值以**参数与流程**形式移植：token 刷新只
 | 原文 | `GET /v1.0/me/messages/{id}/$value` → 完整 MIME，与 IMAP 路径共用解析入库 |
 | 只读 | 仅 list 与 GET `$value`，绝不 PATCH/POST/DELETE（与 3.1 同一原则） |
 
-**增量策略（M2 起 delta 优先）**：`folder_states.delta_link` 持久化 Graph 的 delta 游标。有 delta_link → 直接 `GET {delta_link}`（`@odata.nextLink` 分页滚动至 `@odata.deltaLink`），响应只含上次之后的变更，窗口极窄；无 delta_link（首次/失效）→ `$filter=receivedDateTime ge {游标}` 时间窗列表，完整拉取后以 `delta?$deltatoken=latest` 引导出初始 delta_link。delta_link 失效（410 Gone）自动退回时间窗路径并重建 delta，`last_seen_at` 持续作为兜底游标（取本批最大 `receivedDateTime`，只前进不后退）。两路共用去重与幂等：每页先批量查询已入库的 `graph_id`，只对未见过的消息拉取 `$value`，`(account_id, graph_id)` 唯一索引兜底（边界秒与 delta 重放重拉均不重复入库）；`@removed` 条目（无 `receivedDateTime`）自然跳过——本服务只收不删，远端删除不回写。一个文件夹**完整**拉取成功后才推进游标，中途失败不推进。首次同步与 IMAP 同规：只拉最近 `initial_sync_days` 天。
+**增量策略（M2 起 delta 优先）**：`folder_states.delta_link` 持久化 Graph 的 delta 游标。有 delta_link → 直接 `GET {delta_link}`（`@odata.nextLink` 分页滚动至 `@odata.deltaLink`），响应只含上次之后的变更，窗口极窄。无 delta_link（首次/失效）→ **先**以 `delta?$deltatoken=latest` 引导出初始 delta_link，**再**走 `$filter=receivedDateTime ge {游标}` 时间窗列表。引导必须在列表之前：delta 令牌对应"此刻"的状态，而时间窗列表可能跑很久（每封原文一次请求，大邮箱首次同步以分钟计），其间到达的邮件不在列表里——引导放在后面的话，这些邮件既没被列表带到、也不在 delta 令牌之后，从此再也拉不到；先引导则它们落在 delta 的覆盖范围内，下一轮就会带出来（与列表重叠的部分按 `graph_id` 去重）。引导请求被 Graph 明确拒绝（4xx）时退而只用时间窗列表；认证失败、网络错误、入库错误则整轮上抛。
+
+delta_link 失效（410 Gone / 404 / 400）自动退回时间窗路径并重建 delta，`last_seen_at` 持续作为兜底游标（取本批最大 `receivedDateTime`，只前进不后退）。两路共用去重与幂等：每页先批量查询已入库的 `graph_id`，只对未见过的消息拉取 `$value`，`(account_id, graph_id)` 唯一索引兜底（边界秒与 delta 重放重拉均不重复入库）；`@removed` 条目（无 `receivedDateTime`）自然跳过——本服务只收不删，远端删除不回写。一个文件夹**完整**拉取成功后才推进游标，中途失败不推进。首次同步与 IMAP 同规：只拉最近 `initial_sync_days` 天。
+
+**单轮分页上限**：一轮最多走 100 页（5000 条变更），达到即收工、下一轮接着走。时间窗列表从 `last_seen_at` 续走（游标每轮都推进，进程重启后也能接上），delta 链把尚未走完的 `nextLink` 当游标存下。不这样做的话，超大邮箱的首次同步或一条很长的变更流每一轮都从头走、在同一处停下，永远走不完；列表没走完时本轮的 delta 引导结果也不作数（它只覆盖"本轮开始之后"的变更，而列表里还有更早的邮件没走到）。
+
+**错误处理**：
+- **单封取原文失败**（列表与取原文之间被删/移走 404、无权访问 403、无法导出 422 …）只跳过这一封，不让整轮失败——否则游标不前进，下一轮又从这封开始，整个账号从此卡死，后面的邮件永远拉不到。**连续 10 封**失败则视为账号级故障（权限、应用注册），中止本轮。
+- **401**：访问令牌可能在会话途中过期。先强制刷新一次令牌再重试；刷新被明确拒绝（`invalid_grant`）才是凭据失效，刷新成功后仍 401 说明这份授权不允许读邮件（应用注册缺 `Mail.Read`、用户未同意），同样只能重新授权。
+- **429 / 503 / 504**：按 `Retry-After` 等待后就地重试，至多 2 次（单次等待封顶 60 秒，没有头时 2 秒起逐次加倍）；仍失败交给 worker 退避。
 
 **消息坐标**：Graph 消息无 UIDVALIDITY/UID，唯一坐标是 `graph_id`（messages 表列，`UNIQUE(account_id, graph_id)`）；IMAP 唯一键的 uid 位由 graph_id 哈希填充以保持两路统一（32 位哈希碰撞时入库事务内线性探测下一个空闲 uid），`.eml` 文件名用 `g-{sha256(graph_id) 前 16 位十六进制}.eml`（早期版本为 `0-{哈希}.eml`，以 `raw_path` 为准）。
 
-**降级与一致性**：Graph API 返回 401 映射 `auth_failed`（令牌失效），429 与 5xx 走常规指数退避；`invalid_scope` 提示需在 Azure 应用注册补权限。worker 按 `accounts.transport` 分流（`imap` | `graph`），两条路径共用同一状态机、入库事务与心跳语义。
+**降级与一致性**：Graph API 的 401 先强制刷新令牌重试一次，仍被拒才映射 `auth_failed`（令牌失效，或授权不包含读邮件权限）；429 与 5xx 先按 `Retry-After` 就地重试，仍失败再走常规指数退避；`invalid_scope` 提示需在 Azure 应用注册补权限。worker 按 `accounts.transport` 分流（`imap` | `graph`），两条路径共用同一状态机、入库事务与心跳语义。Graph 没有 IDLE，始终按账号的 `poll_interval` 轮询（短连接）。
 
 ---
 
@@ -218,7 +230,7 @@ CREATE TABLE accounts (
   email           TEXT NOT NULL UNIQUE,
   imap_host       TEXT NOT NULL,
   imap_port       INTEGER NOT NULL DEFAULT 993,
-  use_tls         INTEGER NOT NULL DEFAULT 1,
+  use_tls         INTEGER NOT NULL DEFAULT 1,      -- 历史列，恒为 1：加密方式实际由端口决定（993 隐式 TLS / 143 STARTTLS，8）
   username        TEXT NOT NULL,              -- oauth2 账号默认取 email
   auth_type       TEXT NOT NULL DEFAULT 'password',  -- password | oauth2
   client_id       TEXT,                       -- auth_type='oauth2' 时必填（Azure 应用注册 ID）
@@ -245,6 +257,8 @@ CREATE TABLE folder_states (
   last_uid     INTEGER NOT NULL DEFAULT 0,
   last_seen_at DATETIME,                      -- Graph 路径时间游标（receivedDateTime 兜底，3.6）
   delta_link   TEXT,                          -- Graph delta 游标（3.6；失效退回 last_seen_at）
+  initial_done INTEGER NOT NULL DEFAULT 1,    -- 该文件夹的首次同步已完整走完（008 迁移；0 = 还没走完，
+                                              --   此时同步进来的邮件都算历史邮件，不通知，3.4）
   PRIMARY KEY (account_id, folder)
 );
 
@@ -276,6 +290,9 @@ CREATE TABLE messages (
 );
 CREATE UNIQUE INDEX idx_messages_graph ON messages(account_id, graph_id) WHERE graph_id IS NOT NULL;
 CREATE INDEX idx_messages_account_time ON messages(account_id, received_at DESC);
+-- 按时间排序的邮件列表（ORDER BY received_at）与"今日收信"计数（received_at >= 日界）走这个单列索引
+-- （007 迁移）；上面那个以 account_id 开头，只对"单账号 + 时间"的查询有效。
+CREATE INDEX idx_messages_received ON messages(received_at DESC);
 CREATE INDEX idx_messages_message_id ON messages(account_id, message_id);
 -- 未读计数的高频查询（账号列表徽标、全局未读数）走部分索引，避免全表扫
 CREATE INDEX idx_messages_unread ON messages(account_id) WHERE is_read = 0;
@@ -344,6 +361,7 @@ CREATE INDEX idx_deliveries_webhook ON webhook_deliveries(webhook_id);
 说明：
 - 附件不单独落盘，下载时从 `.eml` 实时解析，省去一套存储逻辑。日后若附件下载频繁再优化。
 - **oauth2 账号的 `credential_enc` 是"活"数据**：令牌轮换（3.5）时服务会加密重写该字段。API 层不暴露此差异，凭据一律不回显。
+- **`folder_states` 的行何时出现**：常规是首封邮件入库时建立；008 起 worker 在首次同步**开始前**就先建一个全零行并置 `initial_done = 0`，整轮首次同步走完才置 1（3.4）。迁移给存量行的默认值是 1——它们在 008 之前就已经完成过首次同步。
 - **数据量级**：低频收件——千级账号中大部分数天一封，日增约百级～千级、年增百万行内，SQLite 从容应对，上述索引留足余量。`q` 关键字 LIKE 搜索在此量级可接受；数据量显著增长后再引入 FTS / 全文索引（M4）。
 - 千级账号的**未读徽标**是高频读：列表页直接走 `idx_messages_unread` 聚合，不另设计数表；若仍成瓶颈再加定时聚合缓存。
 
@@ -397,9 +415,10 @@ X-MailHub-Signature: sha256=<hex(HMAC_SHA256(secret, timestamp + "." + body))>
 - 投递器循环取 `status='pending' AND next_retry_at <= now` 的记录，并发数由 `MAILHUB_WEBHOOK_CONCURRENCY` 配置（默认 4，低频收件下足够），请求超时 10 秒。
 - 返回 2xx 视为成功，其他情况重试。
 - 重试间隔：10 秒、1 分钟、5 分钟、30 分钟、2 小时，共 5 次，之后标记为 `failed`。
-- 失败记录可通过 API 手动重发。
+- 失败记录可通过 API 手动重发；重发时重试计数清零，它重新拥有完整的 5 次重试机会。
 - 语义为**至少一次**投递，下游用 `delivery_id` 或 `message.id` 做幂等。
-- 投递记录保留 30 天后自动清理。
+- 只投递**启用中** webhook 的记录：被禁用的 webhook，其 `pending` 记录原样保留，重新启用后继续。
+- 投递记录中**已结束的**（`success` / `failed`）保留 30 天后自动清理，由每日维护执行（与 retention 同一轮）；`pending` 的不清理——webhook 被禁用期间排队的那些，本该在重新启用后送达，按时间一刀切会把它们悄悄删掉。
 
 ---
 
@@ -410,27 +429,29 @@ X-MailHub-Signature: sha256=<hex(HMAC_SHA256(secret, timestamp + "." + body))>
 
 ### 6.1 通用约定
 - 前缀：`/api/v1`
-- 认证：`Authorization: Bearer <token>`，Token 由环境变量 `MAILHUB_API_TOKEN` 配置。单管理员场景一个 Token 足够。
+- 认证：`Authorization: Bearer <token>`，Token 由环境变量 `MAILHUB_API_TOKEN` 配置。单管理员场景一个 Token 足够。SSE 例外（EventSource 带不了请求头）：用 60 秒有效的一次性短票 `?ticket=`（6.5），主 Token 不进 URL。
 - 格式：JSON，时间为 ISO 8601 UTC。
-- 错误：`{"error": {"code": "account_not_found", "message": "..."}}`，配合标准 HTTP 状态码。
-- **列表接口一律分页**：账号和邮件在矩阵规模下都是千/百万级，禁止无界返回。
+- 错误：`{"error": {"code": "account_not_found", "message": "..."}}`，配合标准 HTTP 状态码（`400` 参数或请求错误 / `401` 认证失败 / `404` 不存在 / `409` 冲突 / `503` 依赖未启用）。
+- **列表接口一律分页**：账号和邮件在矩阵规模下都是千/百万级，禁止无界返回；`limit` 上限 200。
+- 所有响应带安全头：`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Content-Security-Policy: object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'`（8）。
 
 ### 6.2 账号管理
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/accounts` | 添加单个账号。**先同步验证 IMAP 登录**，失败直接返回 400，成功后入库并启动 worker |
+| `POST` | `/accounts` | 添加单个账号。邮箱已存在直接返回 409（`account_exists`：先判重，不做登录验证）；否则**先同步验证登录**（Graph 账号验 Graph 令牌，IMAP 账号验 TLS 登录），失败返回 400 不入库，成功后入库并启动 worker。`imap_port` 填 143 时走 STARTTLS（8） |
 | `POST` | `/accounts/batch` | **批量导入**。支持 JSON 数组或 `text/plain` 粘贴 `邮箱----密码----client_id----令牌` 文本（与 main.py 账号文件逐字兼容；Outlook/Hotmail 域名自动套用 oauth2 + **graph 传输**预设，密码段不存储）。只入库（`pending`），后台错峰验证（2.2），立即返回统计；**已存在邮箱跳过不覆盖**（`skipped` 计数）；JSON 模式与导出格式同构，迁移文件可直接导入（名称/文件夹/轮询/提醒/标签一并还原） |
 | `GET` | `/accounts/export` | **导出（迁移）**。裸 JSON 数组与批量导入 JSON 模式同构，POST 回 `/accounts/batch` 即闭环迁移。默认仅配置；`include_credentials=true` 附解密凭据明文——这是"凭据绝不回显"的**显式例外**（迁移必需），文件明文由调用方妥善保管；`q`/`status`/`tag` 筛选同列表。不含已收邮件 |
 | `GET` | `/accounts` | 账号列表（分页）。参数：`page`/`limit`、`q`（名称/邮箱模糊）、`status`（如 `auth_failed`）、`tag`（可重复，OR 命中）。响应每项含 `tags: []` |
 | `GET` | `/tags` | 全部标签与引用账号数（按引用数降序） |
 | `GET` | `/accounts/{id}` | 账号详情。回显可编辑字段当前值（`folders`/`poll_interval`/`username`/`imap_port`/`client_id` 等，供 Web 单账号设置弹窗使用）；密码/refresh_token **绝不回显** |
-| `PATCH` | `/accounts/{id}` | 修改配置、凭据或启停；连接类变更（host/用户名/凭据/文件夹/间隔/重新启用）触发 worker 重启，`notify_enabled`/`name`/`tags` 等纯元数据即时生效不动 worker；`tags`（字符串数组）全量替换；凭据字段（`password`/`refresh_token`）仅在请求中给出时加密覆盖——`auth_failed` 账号提交新凭据后自动重启重试 |
+| `PATCH` | `/accounts/{id}` | 修改配置、凭据或启停；连接类变更（host/用户名/凭据/文件夹/间隔/重新启用）触发 worker 重启，`notify_enabled`/`name`/`tags` 等纯元数据即时生效不动 worker；`tags`（字符串数组）全量替换；凭据字段（`password`/`refresh_token`/`client_id`）仅在请求中给出时才修改（凭据加密覆盖）——**省略 = 不修改，传空串返回 400**；换凭据或重新启用时清掉 `last_error`，`auth_failed` 账号提交新凭据后回到 `pending` 并自动重启重试 |
 | `PATCH` | `/accounts/batch` | 批量操作：启停 `{"ids": [...], "enabled": false}`、批量开关提醒 `{"ids": [...], "notify_enabled": true}` |
-| `DELETE` | `/accounts/{id}` | 删除账号（邮件记录随外键级联删除）。`?purge=true` 时同时删除磁盘上的原始 `.eml` 文件 |
+| `DELETE` | `/accounts/{id}` | 删除账号（邮件记录随外键级联删除）。`?purge=true` 时**立即**删除磁盘上的原始 `.eml` 文件；不带时这些文件失去引用，由每日维护当孤儿回收——`.eml` 不会保留，`purge` 只决定"现在删"还是"稍后自动删"。账号不存在返回 404 |
 | `POST` | `/accounts/{id}/sync` | **手动收取**：立即执行一次增量拉取（插入信号，不重置轮询/IDLE 节奏，3.2）；`error`/`auth_failed` 账号也允许触发，视为一次显式连接尝试 |
-| `POST` | `/accounts/{id}/reauth` | **重新获取令牌**（M4，仅 oauth2 账号）：body `{"code": "授权码或授权完成后的完整跳转 URL"}`。授权码流——用户浏览器打开 Microsoft 授权页（client_id 用账号自身的，scope 按传输分流）登录该邮箱，把跳转地址粘回；服务端兑换**全新 refresh_token** 加密持久化并立即重启 worker。code 一次性、约 10 分钟有效。注：密码换令牌（ROPC）已被 Microsoft 对个人账户禁用（AADSTS9001023），授权码流是 MSA 账号续 token 的路径 |
+| `GET` | `/accounts/{id}/reauth-url` | 取"重新获取令牌"的**授权页地址**（`{"url": …}`）：带 `login_hint` 预填目标邮箱，scope 按传输分流并含 `openid`。地址只在这里维护，客户端不要自己拼——它必须和兑换端点严格一致 |
+| `POST` | `/accounts/{id}/reauth` | **重新获取令牌**（仅 oauth2 账号）：body `{"code": "授权码或授权完成后的完整跳转 URL"}`。授权码流——用户浏览器打开授权页、**用目标邮箱本身**登录，把跳转地址粘回；服务端兑换**全新 refresh_token**，**校验登录身份与目标账号一致**后加密持久化并立即重启 worker。身份不一致、或拿不到可验证的身份，一律拒绝且凭据不变（`account_mismatch` / `identity_unverified`）——浏览器里往往还登着别的账号，不拦的话换来的就是别人的令牌。以别名登记的账号会被判为不一致。code 一次性、约 10 分钟有效。注：密码换令牌（ROPC）已被 Microsoft 对个人账户禁用（AADSTS9001023），授权码流是 MSA 账号续 token 的路径 |
 | `POST` | `/accounts/sync` | 批量手动收取：`{"ids": [...]}`，仍经错峰调度器排队执行（单账号触发立即执行），避免瞬间千级并发 |
-| `POST` | `/accounts/test` | 仅测试连接，不保存 |
+| `POST` | `/accounts/test` | 仅测试连接，不保存。连接失败也是 200（`{"ok": false, "error": …}`），调用方看 `ok` 字段 |
 
 批量导入（JSON 形式）：
 ```json
@@ -537,20 +558,21 @@ oauth2 账号不传 `password`/`username`（username 默认取 email），凭据
 ### 6.4 Webhook 管理
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/webhooks` | 创建。`secret` 不传则自动生成，仅在创建时返回一次 |
+| `POST` | `/webhooks` | 创建。`secret` 不传则自动生成，仅在创建时返回一次；自定义 `secret` 至少 16 字符（过短返回 400 `weak_secret`——签名密钥太短可被暴力猜出） |
 | `GET` | `/webhooks` | 列表 |
 | `PATCH` | `/webhooks/{id}` | 修改 |
 | `DELETE` | `/webhooks/{id}` | 删除 |
 | `POST` | `/webhooks/{id}/test` | 发送一条测试事件 |
 | `GET` | `/webhooks/{id}/deliveries` | 投递记录，可按 `status` 筛选 |
-| `POST` | `/deliveries/{id}/retry` | 手动重发 |
+| `POST` | `/deliveries/{id}/retry` | 手动重发（重试计数清零，立即投递） |
 
 ### 6.5 监控
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/healthz` | 存活检查，无需认证 |
-| `GET` | `/api/v1/events` | **SSE 实时事件流**（M4）：`?token=` 认证（EventSource 无法带 Authorization 头）；新邮件入库推送 `message.new` 事件，载荷为**单封邮件摘要**（`id/subject/from/account`，供浏览器通知）；**历史邮件（首次同步批量）不推**，防通知轰炸（同 5.1）；30s 心跳保活、断线 5s 自动重连；前端据此即时刷新并在后台标签页弹浏览器通知（通知开关在邮件页工具栏，用户手势授权） |
-| `GET` | `/api/v1/status` | 总览：各状态账号数（`auth_failed`/`error` 单列）、今日收信数、待投递与失败 webhook 数、磁盘占用与水位告警 |
+| `POST` | `/api/v1/events/ticket` | 签发 60 秒有效的一次性 SSE 短票（Bearer 认证）。EventSource 无法带 Authorization 头，用短票建连可让主 Token 不出现在 URL 与反向代理访问日志里 |
+| `GET` | `/api/v1/events` | **SSE 实时事件流**（M4）：`?ticket=` 认证（兼容 `?token=`）；新邮件入库推送 `message.new` 事件，载荷为**单封邮件摘要**（`id/subject/from/account`，供浏览器通知）；**历史邮件（首次同步批量）不推**，防通知轰炸（同 5.1）；30s 心跳保活。事件语义是"请刷新"，慢消费者的连接会被丢事件而不阻塞收件。**服务停机时主动结束全部事件流**——SSE 长连接永不自然结束，不主动关的话优雅停机会被一直开着的邮件页拖到超时；前端在 5 秒后换新票重连。前端据此**原地刷新**列表（不重置、不跳回顶部）并在后台标签页弹浏览器通知（通知开关在邮件页工具栏，用户手势授权） |
+| `GET` | `/api/v1/status` | 总览：各状态账号数、今日收信数、待投递与失败投递数、数据目录磁盘占用（缓存 30 秒）。"今日"的日界由可选参数 `day_start`（RFC3339）指定，缺省取**服务器本地时区**的今天零点——容器里不设 `TZ` 就是 UTC，北京时间早上 8 点归零；Web 界面始终传浏览器所在时区的本地零点 |
 
 矩阵规模下状态接口是主要巡检入口：`auth_failed` 数量上升通常意味着令牌批量过期或风控事件，Web 仪表盘直接呈现（7）。
 
@@ -566,22 +588,26 @@ oauth2 账号不传 `password`/`username`（username 默认取 email），凭据
 
 ## 7. Web 界面
 
-矩阵规模的账号数让"简单三页"升级为四个工作区，全部基于上述 API：
+矩阵规模的账号数让"简单三页"升级为五个工作区，全部基于上述 API：
 
 1. **邮件列表**（默认页）
-   - 左侧账号栏：搜索框（千级账号不能靠滚动找）、未读徽标（`idx_messages_unread` 聚合）、"全部账号"聚合视图；列表**虚拟滚动**。
-   - 右侧邮件流：按 `received_at` 倒序、未读加粗、虚拟滚动，支持关键字搜索与未读筛选。
-   - **已读交互**：打开详情默认标记已读（可在设置关闭）；列表行单击切换已读；工具栏"全部标为已读"（`batch-read`）。
-   - **删除交互**：列表多选（复选框、Shift 范围选、"全选当前筛选结果"），工具栏"删除选中"；账号栏提供"清空此账号邮件"（`batch-delete`，二次确认）。
+   - 左侧账号栏：搜索框（千级账号不能靠滚动找）、未读徽标、"全部账号"聚合视图；账号一次取齐，栏内普通滚动（没有做虚拟化，见 2.1 的选型表）。
+   - 右侧邮件流：未读加粗，支持关键字搜索与未读筛选；**无限滚动**（距底 120px 自动加载下一页，显示"已加载 X / 共 Y"，另有"加载更多"按钮兜底），不是虚拟滚动。默认按入库顺序（最新在前）；点击邮箱 / 时间列头可切换为按账号或按时间排序（6.3 的 `sort` / `order` / `offset`）。
+   - 工具栏：关键字搜索（主题 / 发件人）、标签筛选、时间范围、仅未读、浏览器通知开关（页面在后台时才弹系统通知），以及"收取此账号"（6.2 手动收取）、"全部标已读"、"清空此账号"、"删除选中"、"刷新"。邮箱 / 发件人 / 时间三列的列宽可拖拽。
+   - **已读交互**：打开详情即标记已读（没有关闭开关——"可在设置里关闭"尚未实现）；列表行单击打开详情，抽屉里可"标为已读 / 标为未读"；工具栏"全部标已读"（`batch-read`）：在某个账号下标记该账号的全部邮件，在"全部账号"下标记已勾选的邮件。
+   - **删除交互**：列表多选（复选框；表头复选框全选**已加载**的行——设计里的 Shift 范围选与"全选当前筛选结果"尚未实现，超过一屏的邮件目前只能分批勾选），工具栏"删除选中"；进入某个账号后工具栏出现"清空此账号"（均走 `batch-delete`，二次确认）。
    - 明示语义：已读与删除均只作用于 **MailHub 本地副本**，绝不影响邮箱服务器与其他客户端。
-2. **邮件详情**：HTML 正文放入 `sandbox` iframe 渲染，**默认不加载远程图片**（防追踪像素），附件可下载。
-3. **账号管理**：分页表格 + 搜索 + 状态筛选（`auth_failed`、`error` 高亮）；批量启停、批量删除、勾选后**立即收取**（6.2 批量手动收取，后台错峰执行，进度可见）；表格含**提醒开关**列（默认关，支持勾选后批量开启/关闭，对应 5.1 的 `notify_enabled`）；`auth_failed` 账号可逐个或批量提交新凭据。
-   - **批量导入 Outlook/Hotmail**：粘贴或上传 `.txt`，每行 `邮箱----密码----client_id----令牌`（与 main.py 账号文件逐字兼容）。按域名自动识别 Outlook/Hotmail 并套用 oauth2 预设；密码段不使用、不存储。导入立即显示统计（成功数、失败行号与原因），后台验证进度实时可见（账号状态从 `pending` 逐个变为 `idle` / `polling` / `error`）。
-   - 表格显示**最后收取时间**（`last_sync_at`，3.2 心跳语义）与**最新邮件时间**（`last_message_at`）；超过约 15 分钟无心跳的账号高亮，用于区分"没有邮件"与"收取故障"。
+   - **保持现场**：新邮件到达（SSE 事件）或每 60 秒一次的兜底刷新都**原地更新**列表——已加载的行、滚动位置（按视口第一行对齐）与勾选全部保留，不跳回顶部；切换账号或筛选条件时才重置列表并清空勾选。请求按先后顺序生效，后发的响应不会覆盖先发的——快速切换账号或邮件时不会被慢响应带偏。账号栏一次取齐全部账号（按 200 条翻页），未读合计是全部账号的总和而不是当前页的。
+2. **邮件详情**：HTML 正文放入 `sandbox` iframe 渲染，**默认不加载远程图片**（防追踪像素），附件可下载。iframe 文档自带 CSP（`default-src 'none'`，内联样式照常生效）：屏蔽模式下零外部请求，图片位置显示"图片已屏蔽"；用户选择"加载图片"后只放开图片、音视频与字体，脚本、外链样式表、嵌套框架、表单一律不放行。正文里的 `<meta>`（含 `http-equiv="refresh"`）与 `<base>` 在放进 iframe 之前摘除（8）。
+3. **账号管理**：分页表格 + 搜索 + 状态 / 标签筛选（`auth_failed` 红色、`error` 警示色）；批量启停、批量删除、勾选后**排队收取**（6.2 批量手动收取，后台错峰执行；表格每 15 秒自动刷新，据此看进度）；表格含**提醒开关**列（默认关，支持勾选后批量开启/关闭，对应 5.1 的 `notify_enabled`）；`auth_failed` 账号在设置弹窗里**逐个**提交新凭据（没有批量提交入口）。
+   - **批量导入**：粘贴或上传 `.txt`，每行 `邮箱----密码----client_id----令牌`（与 main.py 账号文件逐字兼容）。按域名自动识别 Outlook/Hotmail 并套用 oauth2 预设；密码段不使用、不存储。导入立即显示统计（成功数、跳过数、失败行号与原因），后台验证进度实时可见（账号状态从 `pending` 逐个变为 `idle` / `polling` / `error`）。也接受"导出"生成的迁移 JSON 数组（6.2）。
+   - **导出**（迁移）：导出全部账号为 JSON（名称 / 文件夹 / 轮询间隔 / 提醒开关 / 标签），可选是否**包含凭据明文**（"凭据绝不回显"的显式例外，勾选时有警告）；在目标实例的"批量导入"里粘贴即可，已存在的邮箱跳过。
+   - 表格显示**最后收取时间**（心跳列，`last_sync_at`，3.2 心跳语义）与**最新邮件时间**（`last_message_at`），以及邮件数 / 未读数；邮件页账号栏里**从未成功收取过**的账号（`last_sync_at` 为空）心跳标红。"超过约 15 分钟无心跳的账号高亮"尚未实现——各账号轮询间隔不同，阈值要结合间隔来定。
    - **单账号设置弹窗**：行操作"设置"打开——名称、轮询间隔（低频邮箱建议调大）、收取文件夹（多文件夹 IMAP 不走 IDLE）、标签、IMAP 用户名/主机（Graph 账号不显示）；凭据区按认证方式显示（密码或 client_id + refresh_token），**留空 = 不修改**（服务端不回显凭据）；`auth_failed` 账号在弹窗顶部显示错误与新凭据入口，保存后自动重启收取。只提交实际变化的字段。
-   - **重新获取令牌**（oauth2 账号设置弹窗内，M4）：三步向导——①打开 Microsoft 授权页（用账号 client_id 构造，浏览器登录该邮箱）②把授权后跳转的完整地址粘回 ③服务端授权码兑换全新 refresh_token（加密存储、立即重启收取）。适用于令牌过期/失效的账号抢救。
-4. **仪表盘**：今日收信曲线、账号状态分布、投递积压/失败、磁盘水位。
-5. **设置**（M4）：全局配置在线修改（6.6 五项运行时可变项）；显示每项生效值、是否被数据库覆盖（"已覆盖"标记 + 恢复默认）与生效时机说明；顶部说明优先级与"凭据/进程级项需改环境变量重启"。
+   - **重新获取令牌**（oauth2 账号设置弹窗内，M4）：三步向导——①打开 Microsoft 授权页（地址取自 `GET /accounts/{id}/reauth-url`，已预填目标邮箱；用目标邮箱本身登录，浏览器里登着别的账号时建议用无痕窗口）②把授权后跳转的完整地址粘回 ③服务端授权码兑换全新 refresh_token，**校验登录身份确实是这个账号**（不一致则拒绝、凭据不变，并提示重新登录），通过后加密存储、立即重启收取。适用于令牌过期/失效的账号抢救。
+4. **Webhook 管理**（6.4）：每个 Webhook 一张卡片（启用状态、账号范围、是否含正文、待投递 / 失败数），可直接启停、编辑、删除、发送测试事件；"投递记录"抽屉按状态筛选、分页查看，未成功的可手动重发。新建后 secret **只显示一次**（弹窗保持打开直到点"完成"）。账号范围下拉逐页取齐全部账号（一页最多 200 个），可搜索。
+5. **仪表盘**：四个数字（账号总数、今日收信、待投递 / 失败、磁盘占用）与账号状态分布，每 10 秒自动刷新。"今日"按浏览器所在时区算（请求带 `day_start`，6.5），避免容器按 UTC 在东八区 00:00–08:00 显示成"昨天"。没有按小时的收信曲线。
+6. **设置**（M4）：全局配置在线修改（6.6 五项运行时可变项）；显示每项生效值、是否被数据库覆盖（"已覆盖"标记 + 恢复默认）与生效时机说明；顶部说明优先级与"凭据/进程级项需改环境变量重启"。
 
 登录方式：输入 API Token，存入浏览器 localStorage。
 
@@ -593,10 +619,13 @@ oauth2 账号不传 `password`/`username`（username 默认取 email），凭据
 |---|---|
 | 传输 | 服务本身监听 HTTP，由 Caddy 或 Nginx 反代提供 HTTPS |
 | 邮箱凭据 | AES-256-GCM 加密存储（密码与 refresh_token 同等对待），API 不回显；**上千组邮箱凭据集中存放，`MAILHUB_SECRET_KEY` 即全库钥匙，须妥善保管** |
-| API 认证 | Bearer Token，常量时间比较 |
-| IMAP 连接 | 默认强制 TLS 并校验证书 |
-| HTML 邮件 | sandbox iframe，禁用脚本，默认屏蔽外链资源 |
-| Webhook | HMAC 签名加时间戳，下游可校验来源并防重放 |
+| API 认证 | Bearer Token，常量时间比较。SSE 用一次性短票建连，主 Token 不进 URL 与代理访问日志（6.5） |
+| HTTP 响应头 | 所有响应带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 与 CSP（`object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'`）：邮件里的 `<object>`/`<embed>` 不加载，`<base>` 改不了相对地址的基准，表单不能提交到外站，页面不能被别的站点嵌入（srcdoc iframe 会继承父文档的 CSP） |
+| IMAP 连接 | 强制 TLS 并校验证书：993 等端口隐式 TLS；143 端口用 STARTTLS 升级，升级失败（服务器不支持、证书校验不过）直接拒绝——绝不明文登录 |
+| HTML 邮件 | sandbox iframe + 文档级 CSP，禁用脚本，默认屏蔽外链资源；"加载图片"之后也只放开图片类资源，外链样式表与嵌套框架仍被拒；正文里的 `<meta>` / `<base>` 渲染前摘除（7） |
+| Webhook | HMAC 签名加时间戳，下游可校验来源并防重放；自定义 secret 至少 16 字符 |
+| 日志 | 入库日志不带邮件主题（验证码邮件的主题本身就是验证码，日志不该多一份副本）；身份校验失败时不记录登录的是哪个邮箱，响应里打码 |
+| 重新获取令牌 | 校验登录身份与目标账号一致后才落库新令牌，不一致不修改凭据 |
 | 数据 | 邮件含敏感信息，数据目录权限设为 700 |
 
 ---
@@ -608,8 +637,8 @@ oauth2 账号不传 `password`/`username`（username 默认取 email），凭据
 |---|---|---|
 | `MAILHUB_API_TOKEN` | 必填 | API 访问令牌 |
 | `MAILHUB_SECRET_KEY` | 必填 | 凭据加密主密钥（32 字节，base64） |
-| `MAILHUB_DATABASE_URL` | 空 | 空 → SQLite（data 目录）；否则 PostgreSQL DSN。矩阵规模建议 PG（2.1） |
-| `MAILHUB_LISTEN` | `:8080` | 监听地址 |
+| `MAILHUB_DATABASE_URL` | 空 | 空 → SQLite（data 目录）。**当前版本 PostgreSQL 尚未接入**：填非空值会让服务启动失败（仓库里有 PG 方言的迁移脚本，但执行器只加载 SQLite 方言，它们从未被执行过；接入要做的事见 TECH.md §1.1） |
+| `MAILHUB_LISTEN` | `:8080` | 监听地址（Docker 镜像设为 `:18099`） |
 | `MAILHUB_DATA_DIR` | `./data` | 数据库（SQLite 时）和邮件存储目录 |
 | `MAILHUB_MAX_MESSAGE_SIZE` | `50MB` | 单封邮件大小上限 |
 | `MAILHUB_RETENTION_DAYS` ◆ | `0` | 邮件保留天数，0 = 永久。低频收件下默认永久保留无存储压力（9.4），需要时再设 |
@@ -619,20 +648,25 @@ oauth2 账号不传 `password`/`username`（username 默认取 email），凭据
 | `MAILHUB_POLL_INTERVAL_DEFAULT` ◆ | `60` | 账号轮询间隔默认值（秒），批量导入时填充到各账号 `poll_interval`；账号级可单独修改 |
 | `MAILHUB_FALLBACK_INTERVAL` ◆ | `300` | IDLE 模式兜底拉取间隔（秒），同时是心跳推进上限（3.2） |
 | `MAILHUB_WEBHOOK_CONCURRENCY` | `4` | Webhook 投递并发（5.3） |
+| `TZ` | 容器内为 UTC | 服务器时区（IANA 名称，如 `Asia/Shanghai`；镜像自带 tzdata）。影响日志时间，以及 `/status` 不传 `day_start` 时"今日收信"的日界（6.5）。Web 界面始终按浏览器所在时区算，不受影响 |
 
 标 ◆ 的五项为**运行时可变项**：除环境变量外，可在 Web 设置页 / `PUT /api/v1/settings`（6.6）在线修改，
 存入 `settings` 表，优先级 **DB 覆盖 > 环境变量 > 默认值**；保存后按各项说明的时机生效（无需重启）。
 未标记项（凭据、监听地址、数据目录、错峰/并发等）为进程级配置，修改需重启。
 
+**每日维护**（启动 1 分钟后第一轮，此后每 24 小时一轮，按序执行）：① retention——`retention_days > 0` 时删除早于保留窗口的邮件（行 + 级联附件/投递记录 + `.eml`）；② 孤儿回收——`mails/` 下数据库不再引用的 `.eml`（文件已存在 5 分钟以上才收，避开"已定稿、事务未提交"的瞬间）与超过 24 小时的 `.part` 写入残留；③ 投递记录——清理 30 天前的终态记录（5.3）。
+
 ### 9.2 部署
 镜像构建见仓库 `Dockerfile`（多阶段：node 前端 → Go 静态二进制 → distroless 运行时）；凭据经根目录 `.env`（`KEY=value`，无 export 前缀，勿提交）注入。
 ```yaml
-# docker-compose.yml（仓库已交付同款）
+# docker-compose.yml（仓库已交付同款，节选）
 services:
   mailhub:
     build: .
     image: mailhub:latest
     restart: unless-stopped
+    stop_grace_period: 30s           # 要盖住服务的停机预算，见下
+    user: "1000:1000"                # 非 root 运行
     ports: ["18099:18099"]
     volumes: ["mailhub-data:/data"]
     ulimits: { nofile: 8192 }        # 千级 IMAP 长连接需要（2.2）
@@ -641,25 +675,27 @@ services:
       MAILHUB_LISTEN: :18099
       MAILHUB_API_TOKEN: ${MAILHUB_API_TOKEN}
       MAILHUB_SECRET_KEY: ${MAILHUB_SECRET_KEY}
-      MAILHUB_RETENTION_DAYS: 90     # 0/省略 = 永久（9.1）
-      MAILHUB_DATABASE_URL: ${MAILHUB_DATABASE_URL}   # 留空则用 SQLite
-
-  postgres:                           # 可选：矩阵规模建议启用
-    image: postgres:17
-    volumes: ["./pgdata:/var/lib/postgresql/data"]
-    environment:
-      POSTGRES_DB: mailhub
-      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      # TZ: Asia/Shanghai           # 日志时间与 /status 的缺省日界（9.1）
+      # MAILHUB_RETENTION_DAYS: 90   # 0/省略 = 永久
 ```
+
+PostgreSQL 当前尚未接入（2.1）；compose 文件里留有接入后可用的样板注释。
+
+**停机序列**（收到 SIGTERM / SIGINT，例如 `docker stop`）：
+1. 结束全部 SSE 长连接并停止 HTTP（等其余请求收尾，上限 5 秒）；
+2. 等 worker、投递器、维护任务退出（上限 20 秒）——IMAP 的 IDLE 收尾（≤10 秒）与 LOGOUT（≤5 秒）都有上限，连接是在服务端看来"正常登出"地断开，而不是被硬掐；
+3. 关闭数据库。
+
+两段预算合计必须落在容器的停止宽限期之内，所以 compose 设了 `stop_grace_period: 30s`——docker 默认只给 10 秒，超时即 SIGKILL，上面的收尾就来不及走完。
 
 ### 9.3 数据目录
 ```
 data/
 ├── mailhub.db            # SQLite（DATABASE_URL 为空时）
 └── mails/
-    └── {account_id}/{yyyy-mm}/{uidvalidity}-{uid}.eml
+    └── {account_id}/{yyyy-mm}/{uidvalidity}-{uid}.eml      # Graph 账号为 g-{sha256(graph_id) 前 16 位十六进制}.eml
 ```
-备份时打包整个 `data/` 目录即可；使用 PostgreSQL 时另备数据库。
+备份时打包整个 `data/` 目录即可。数据库迁移在服务启动时自动应用（`internal/store/migrations/`，按序号递增，每种方言一份）；升级版本后首次启动会执行新迁移，建议先备份 `data/`。
 
 ### 9.4 资源预估（按 1000 账号、低频收件）
 | 项 | 估算 |
@@ -685,13 +721,13 @@ data/
 ## 11. 关键设计决策小结
 
 1. **单进程撑到千级账号**：连接错峰、单主机 IDLE 预算（超出降级轮询）、认证失败即停，三者共同消化矩阵规模的风控与服务商限制，不引入微服务（2.2）。
-2. **SQLite 覆盖全部规划规模**：低频收件（日增百级～千级、年增百万行内）下零运维足够；DDL 兼容 PostgreSQL，量级显著变化时一条 `DATABASE_URL` 切换（2.1）。
+2. **SQLite 覆盖全部规划规模**：低频收件（日增百级～千级、年增百万行内）下零运维足够；DDL 兼容 PostgreSQL，量级显著变化时一条 `DATABASE_URL` 切换（2.1）。注：当前版本 PostgreSQL 驱动尚未接入，填了库地址会启动失败。
 3. **IDLE 加轮询兜底**：兼顾实时性和可靠性；轮询同时是 IDLE 预算超限时的正式降级路径，而非仅是后备。
 4. **对远端完全只读**（`EXAMINE` 和 `BODY.PEEK`）：已读与删除（`batch-read` / `batch-delete`）只作用于本地副本，绝不干扰邮箱服务器与其他客户端。
 5. **保留原始 `.eml`**：解析逻辑有 bug 或以后要加功能时，可以随时重新解析，数据不丢；低频收件下磁盘成本极低，默认永久保留。
 6. **Webhook 轻载荷加 API 取详情，且默认静默**：通知快，下游按需取正文；提醒是账号级开关（`notify_enabled`，默认关，5.1）——矩阵中多数账号只为收取存档，默认全员广播既是噪音也是信息泄露面。
 7. **认证失败即停**：密码错误或 `invalid_grant` 都立即停止重试，矩阵规模下单账号的风控可能危及同 IP 全体账号。
-8. **刷新令牌是"活"凭据**：oauth2 账号的 refresh_token 会被服务端轮换，轮换即在同一事务中持久化（main.py 的 `--save-token` 已验证必要性）。
+8. **刷新令牌是"活"凭据**：oauth2 账号的 refresh_token 会被服务端轮换，轮换即持久化（连接时与会话途中都一样，main.py 的 `--save-token` 已验证必要性）。
 9. **Graph 是 Outlook 家族主传输**：存量授权仅含 Graph 权限（IMAP scope → invalid_scope，M1 实测），补权限需全员重新授权对矩阵不现实；Graph `$value` 取 MIME 原文与 IMAP 共用解析入库，`graph_id` 唯一索引保证幂等（3.6）。
 10. **批量导入后台验证**：导入只入库立即返回，验证与首同步按错峰节奏进行（2.2），`main.py` 的账号文件格式直接兼容（6.2）。
 11. **`last_sync_at` 即账号心跳**：成功收件检查即更新（无论有无新邮件），失败不更新——矩阵运营据此区分"无邮件"与"账号异常"，密码段不存储则是最小凭据原则在批量导入上的体现。
