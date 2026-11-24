@@ -158,6 +158,7 @@ func (w *watchdog) run() {
 			}
 			select {
 			case <-w.done: // 与 stop 同时发生：操作其实已完成，不动连接
+				return
 			default:
 			}
 			w.stalled.Store(true)
@@ -255,9 +256,13 @@ func (g *goClient) login(ctx context.Context, conn net.Conn, username string, cr
 	g.unilateral = make(chan struct{}, 1)
 	g.conn = imapclient.New(g.activity, g.options(nil))
 	// 先等问候：服务器以 "* BYE" 拒绝接入时，后面任何命令都只会得到一个含义不明的
-	// 写入错误（读 goroutine 已经退出），拿不到 BYE 的原文。
-	if err := g.conn.WaitGreeting(); err != nil {
-		return "", fmt.Errorf("IMAP 问候: %w", err)
+	// 写入错误（读 goroutine 已经退出），拿不到 BYE 的原文。加看门狗兜住服务器握手后
+	// 迟迟不发问候或 ctx 取消的场景。
+	wd := g.startWatch(ctx, g.conn)
+	err := g.conn.WaitGreeting()
+	wd.stop()
+	if err != nil {
+		return "", wd.decorate(fmt.Errorf("IMAP 问候: %w", err))
 	}
 	return g.authenticate(ctx, username, cred)
 }

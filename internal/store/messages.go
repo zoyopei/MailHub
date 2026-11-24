@@ -347,7 +347,9 @@ func (s *Store) AdvanceFolderUID(accountID int64, folder string, uidv, lastUID u
 		ON CONFLICT (account_id, folder) DO UPDATE SET
 			uidvalidity = excluded.uidvalidity,
 			last_uid = CASE WHEN folder_states.uidvalidity = excluded.uidvalidity
-				THEN MAX(folder_states.last_uid, excluded.last_uid) ELSE excluded.last_uid END`,
+				THEN CASE WHEN folder_states.last_uid < excluded.last_uid
+					THEN excluded.last_uid ELSE folder_states.last_uid END
+				ELSE excluded.last_uid END`,
 		accountID, folder, uidv, lastUID)
 	return err
 }
