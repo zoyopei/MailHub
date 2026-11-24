@@ -156,7 +156,7 @@ main.py（Python）的价值以**参数与流程**形式移植：token 刷新只
 | 重复邮件 | IMAP：`(account_id, folder, uidvalidity, uid)` 唯一索引；Graph：`(account_id, graph_id)` 唯一索引（3.6）。重复插入直接忽略 |
 | UIDVALIDITY 变化（少见） | 更新记录并将 `last_uid` 归零，按首次同步规则重拉。已存在的邮件按 `Message-ID` 头去重，不重复通知 |
 | 超大邮件 | 超过 `max_message_size`（默认 50MB）只保存头部信息，标记 `truncated=true` |
-| 认证失败（密码错误 / `invalid_grant`） | 账号状态置为 `auth_failed` 并**停止重试**（矩阵规模下防风控升级，2.2），等待用户通过 API 更新凭据或重新授权 |
+| 认证失败（密码错误 / `invalid_grant`） | 账号状态置为 `auth_failed` 并**停止重试**（矩阵规模下防风控升级，2.2），等待用户通过 API 更新凭据或重新授权。只有服务器**明确拒绝凭据**才算认证失败；网络断连、服务器无响应、以 `* BYE` 拒绝接入（限流/维护）都属于连接类错误，按退避重连，不会把账号停在 `auth_failed` |
 | 刷新令牌轮换（oauth2） | 刷新接口返回新 refresh_token 时在同一事务中更新 `credential_enc`（3.5）。更新失败不影响本次已获取的 access_token，下次连接前重试 |
 | 解析失败 | 原始 `.eml` 照常保存，记录 `parse_error`，仍然发送通知 |
 
@@ -289,6 +289,9 @@ CREATE TABLE attachments (
   size         INTEGER,
   part_index   INTEGER NOT NULL               -- 在 MIME 结构中的序号
 );
+-- 外键子表索引（006 迁移）：SQLite 的外键子表没有索引时，父表每删一行都要全表扫子表——
+-- 删邮件/删账号/删 webhook 的级联删除会随数据量线性变慢。三个子表各建一个。
+CREATE INDEX idx_attachments_message ON attachments(message_id);
 
 -- 账号标签（每账号多标签、按标签过滤；004 迁移）
 CREATE TABLE tags (
@@ -334,6 +337,8 @@ CREATE TABLE webhook_deliveries (
   updated_at    DATETIME NOT NULL
 );
 CREATE INDEX idx_deliveries_pending ON webhook_deliveries(status, next_retry_at);
+CREATE INDEX idx_deliveries_message ON webhook_deliveries(message_id);  -- 外键子表索引，见 attachments
+CREATE INDEX idx_deliveries_webhook ON webhook_deliveries(webhook_id);
 ```
 
 说明：

@@ -62,7 +62,7 @@ mailhub/
 │   │   └── oauth.go             # XOAUTH2 SASL（go-sasl 未提供，自实现）
 │   ├── graphclient/graph.go     # Graph API 实现（列表 + $value，Outlook 家族主传输，DESIGN 3.6）
 │   ├── sync/
-│   │   ├── manager.go           # 错峰队列、Reload/Trigger/Remove、worker 注册表、settingInt 配置缓存（30s TTL）
+│   │   ├── manager.go           # 错峰队列、Reload/Trigger/Remove、SetNotifyEnabled、worker 注册表、settingInt 配置缓存（30s TTL）
 │   │   ├── worker.go            # 单账号状态机（run→session→idleLoop/pollOnce，3.2）
 │   │   └── budget.go            # 单主机 IDLE 预算（2.2；limit 动态：Acquire(host, limit)，每次会话从配置读取）
 │   ├── notify/deliverer.go      # 投递器：扫描/并发/HMAC/重试（5）+ 投递记录 30 天自清
@@ -92,7 +92,7 @@ mstoken / mailparse / crypto / store / config：不依赖任何上层，可独�
 `dial` 构造器由 cmd/main 注入 sync 与 api：按 `acct.Transport` 返回 imapclient 或 graphclient 实现（graphclient 的去重回调闭包捕获 accountID，接线 `store.HasGraphIDs`），两包互不感知。
 
 两个关键解耦点：
-- `sync.Manager` 对 `api` 只暴露 `TriggerNow / TriggerBatch / ReloadAccount / RemoveAccount` 控制面方法；
+- `sync.Manager` 对 `api` 只暴露 `TriggerNow / TriggerBatch / ReloadAccount / RemoveAccount / SetNotifyEnabled / RefreshSettings` 控制面方法；
 - `sync` 出站只有一个 `Notifier.Wake()` 通道（IngestMessage 提交后调用）；main 用 `notifierGroup` 把投递器与 SSE Hub 并列挂上。
 
 ### 2.2 store：事务边界与双库兼容
@@ -101,7 +101,7 @@ mstoken / mailparse / crypto / store / config：不依赖任何上层，可独�
 
 **方言约定**：布尔一律 `INTEGER 0/1`（PG 侧同用 int）；时间一律 UTC；自增主键 SQLite 用 `INTEGER PRIMARY KEY`、PG 用 `GENERATED ALWAYS AS IDENTITY`（迁移文件各自处理，代码层无感知）。
 
-**SQLite DSN**：`journal_mode=WAL, busy_timeout=5000, foreign_keys=on`。低写入量下 WAL 单写者不构成瓶颈（4）。
+**SQLite DSN**：`journal_mode=WAL, busy_timeout=5000, foreign_keys=on, _txlock=immediate`。`_txlock=immediate` 让事务一开始就取写锁（拿不到则等 busy_timeout）：默认的 deferred 事务是"先读后写"，WAL 下读快照建立后只要有别的连接提交过写，升级写锁就**立即**返回 `SQLITE_BUSY_SNAPSHOT`（`database is locked (517)`），busy_timeout 对它不生效——`IngestMessage` 正是"查重 SELECT → INSERT"，多 worker 并发入库会大量失败（实测 2 路并发约 3/4 失败，账号被置 error 并退避）。本包的事务全部含写，immediate 无副作用；不要改成手写重试。低写入量下 WAL 单写者不构成瓶颈（4）。
 
 **事务边界归属 store，关键方法**：
 
@@ -164,13 +164,21 @@ func (t *TokenCache) Token(ctx context.Context, scope, email, clientID, refreshT
 var ErrReauth = errors.New("invalid_grant")   // 由 worker 映射为 auth_failed（3.4）；Graph 401 同样映射
 ```
 
-**imapclient**：go-imap v2 实现。`Select(ReadOnly)` 即 EXAMINE；`BODY.PEEK[]` 拉原文；oauth2 走自实现 XOAUTH2 SASL（go-sasl 仅有 OAUTHBEARER）。
+**imapclient**：go-imap v2 实现。`Select(ReadOnly)` 即 EXAMINE；`BODY.PEEK[]` 拉原文；oauth2 走自实现 XOAUTH2 SASL（go-sasl 仅有 OAUTHBEARER）。增量搜索发 `UID SEARCH UID n:*`。注意 go-imap 的 `Fetch`/`Search` 的 NumSet **必须传值类型** `imap.UIDSet`：传 `*imap.UIDSet` 能通过编译（方法集相同），运行时却 `panic: imap: invalid NumSet type`，worker 里的 panic 会让整个进程退出。
+
+go-imap v2 beta.9 有三处缺口，由本包自己补上（升级依赖时逐条复核，`client_test.go` 的假服务器测试会兜住）：
+
+- **IDLE 唤醒**：`IdleCommand.Wait()` 只在 `Close()`/断连时返回，服务器发 EXISTS 并不会唤醒它。构造客户端时设置 `Options.UnilateralDataHandler.Mailbox`；回调在 go-imap 的读 goroutine 上执行，必须立即返回——只向容量 1 的 channel 非阻塞发信号。`Idle` 收到信号后发 `DONE` 正常结束并返回 `notified=true`，连接保持可用（手动收取/兜底拉取都在同一连接上）。只对 `NumMessages != nil`（EXISTS）发信号，FLAGS/PERMANENTFLAGS 变化忽略；两条命令之间到达的 EXISTS 信号保留到下一次 IDLE（立即补拉）；IDLE 收尾时清掉累积的信号（随后的增量拉取已覆盖，留着会让下一次 IDLE 空转）。EXAMINE 期间的 EXISTS 归属那条 Select 命令，不触发回调。
+- **看门狗（`watchdog`）**：go-imap 只在"响应已开始"之后设读超时（普通响应 30s、字面量 5min），等下一个响应的**第一个字节**没有任何超时——服务器卡死或连接被中间设备静默丢弃（无 FIN/RST）时 `Wait()` 永久阻塞，ctx 取消也无效。登录、`FetchFolder`、IDLE 握手都在看门狗监视下：持续 `stallTimeout`（2min）没收到任何数据 → 断开连接（挂起的命令随之以错误完成，`decorate` 把原因翻译成"IMAP 服务器超过 2m0s 无响应，已断开"）；ctx 取消 → 立即断开（停机/删除账号不再被卡住的连接拖住）。入库回调执行期间暂停无响应判定（`pause`/`resume`：本地慢不算服务器卡死）。IDLE **等待**阶段不设看门狗（静默是正常的），由 TCP keepalive、25 分钟上限和下面的收尾上限兜底。
+- **收尾上限**：IDLE 收尾（发出 DONE 后等 tagged OK）超过 `idleStopTimeout`（10s）、`LOGOUT` 超过 `logoutTimeout`（5s）即强制断开——这两条是每个会话必经的路径，卡住等于 worker 卡住。
+
+**登录错误分类**：只有服务器明确回了 tagged `NO`/`BAD`（`*imap.Error`）才包成 `ErrAuthFailed`（→ `auth_failed` 停止重试，DESIGN 3.4）；断连、无响应、ctx 取消、`* BYE`（限流/维护/连接数超限）一律按普通错误走退避重连。登录前先 `WaitGreeting()`，服务器以 `* BYE` 拒绝接入时能拿到原文。
 
 **graphclient**：纯 HTTP 实现。列表 `$filter=receivedDateTime ge 游标&$orderby=asc&$select=id,receivedDateTime`（nextLink 分页），每页批量 seen 去重后逐封 `GET /me/messages/{id}/$value` 取 MIME；401→`ErrReauth`、429/5xx→普通错误走退避；仅 GET，绝不写远端（3.6）。
 
 要点：
 - **access_token 进程内缓存**（mstoken.TokenCache）：轮询模式短连接重连时直接用缓存令牌，过期前 60s 才刷新——不重蹈 main.py 每次运行必刷新的覆辙（它是短命进程，我们是常驻服务）。
-- 轮换的 refresh_token 由 worker 拿到后**立即** `UpdateCredential`，不等邮件事务。
+- 轮换的 refresh_token 由 worker 拿到后**立即** `UpdateCredential`，不等邮件事务；同时更新 worker 的内存快照 `acct.CredentialEnc`（下个会话 `credentials()` 解密的是它）。只写库不更新快照的话 worker 一直拿旧令牌，与 TokenCache 里存的新令牌对不上，缓存永不命中，每个轮询周期都会再打一次令牌端点。
 - 刷新在 TokenCache 锁内串行（账号级互斥，3.5）。
 - 令牌端点 429 → 返回错误，走 worker 统一退避。
 
@@ -199,6 +207,7 @@ func (m *Manager) ReloadAccount(ctx context.Context, id int64) // PATCH 后：ca
 func (m *Manager) RemoveAccount(id int64)                 // DELETE：cancel worker、释放预算
 func (m *Manager) TriggerNow(id int64)                    // 单账号：向 worker.trigger 非阻塞发送（立即）
 func (m *Manager) TriggerBatch(ids []int64)               // 批量：进错峰队列（优先于待启动账号）
+func (m *Manager) SetNotifyEnabled(id int64, on bool)      // PATCH notify_enabled：更新运行中 worker 的开关，不重启
 ```
 
 **错峰队列**：单消费者 goroutine，按 `MAILHUB_CONNECT_STAGGER` + 每账号随机抖动逐个 spawn；手动批量请求插队首（6.2 语义）。
@@ -217,7 +226,7 @@ run(ctx):
     其他错误   → status=error; sleep backoff（×2 封顶 5min）; continue
 
 session(ctx):                    // 一次连接生命周期
-  Connect()                      // oauth2：刷新令牌；轮换 → 立即 UpdateCredential
+  Connect()                      // oauth2：刷新令牌；轮换 → 立即 UpdateCredential + 更新内存快照
   if canIdle(服务器支持 && 单文件夹 && budget.Acquire(host)):
       defer budget.Release; idleLoop(ctx)                     // IDLE 会话：阻塞至断线/停止
   else:
@@ -227,8 +236,8 @@ idleLoop(ctx):                   // 长连接会话（3.2 状态机）
   pollOnce()                     // 初始拉取（含首同步历史邮件标记）
   loop:
     select:
-      idleNotify   → fetchIncremental → 重新 IDLE             # EXISTS/EXPUNGE（误报无害：no-op+心跳）
-      25m 超时     → 重新 IDLE                                 # 协议 29 分钟内刷新要求
+      idleNotify   → fetchIncremental → 重新 IDLE             # EXISTS = 有新邮件（imapclient 经 UnilateralDataHandler 唤醒，2.4）
+      25m 超时     → fetchIncremental → 重新 IDLE             # 协议 29 分钟内刷新要求；顺带心跳
       fallbackTick → fetchIncremental                          # FALLBACK_INTERVAL 兜底（防通知丢失）
       trigger      → 退出 IDLE → fetch → 重新 IDLE             # 手动：不重置任何计时（3.2）
       ctx.Done     → return
@@ -238,6 +247,8 @@ pollOnce(ctx):                   // 各文件夹增量拉取 + TouchAccount 心�
 ```
 
 **手动触发合并**：`trigger chan struct{}` 容量 1，发送方非阻塞（select+default 丢弃）——正在拉取时到达的信号天然合并，不排队。
+
+**提醒开关的实时值**：入库时读的是 `worker.notify`（`atomic.Bool`），不是 `acct.NotifyEnabled`——`acct` 是 worker 启动时的账号快照，改了库里的值它不会变。`spawn` 时初始化；PATCH `notify_enabled`（单个/批量）后 API 调 `Manager.SetNotifyEnabled` 即时更新，不重启 worker（不打断 IDLE 和进行中的拉取）。worker 未运行（禁用、`auth_failed`、排队中）时是空操作，它下次启动从库读取。
 
 **fetchIncremental 内部**：`FetchSince` → 逐封 `mailparse.Parse` → 写 `.eml` 到 `data/mails/...` → `IngestMessage`（每封一事务，3.3）→ 提交后 `notify.Wake()`；UIDVALIDITY 变化按 3.4 归零重拉。
 
@@ -284,7 +295,7 @@ IMAP 服务器 ──▶ imapclient ◀── sync.worker（每账号一个）
 
 ## 3. 错误处理与可观测性
 
-- **错误三分类**（与 3.4 对应）：连接类（重试+退避）、认证类（停，`auth_failed`）、解析类（入库但标记 `parse_error`）。
+- **错误三分类**（与 3.4 对应）：连接类（重试+退避）、认证类（停，`auth_failed`）、解析类（入库但标记 `parse_error`）。分界线只有一条：**服务器明确拒绝了凭据**才算认证类。IMAP 登录即 tagged `NO`/`BAD`（2.4）；断连、无响应、`* BYE`、ctx 取消都是连接类——误判成认证类会把账号停在 `auth_failed`，重启也不会自动恢复。
 - slog JSON 字段约定：`account_id`、`host`、`worker_event`（spawn/idle/polling/backoff/stop）、`delivery_id`、`error`。账号状态迁移必须留痕。
 - 心跳与巡检不靠日志，靠 `GET /api/v1/status` 与账号列表（6.5、7）。
 
@@ -293,13 +304,16 @@ IMAP 服务器 ──▶ imapclient ◀── sync.worker（每账号一个）
 | 层 | 方式 |
 |---|---|
 | mailparse | 真实 `.eml` 样本表驱动（含乱码、超大截断、坏格式） |
-| store | SQLite `:memory:` 跑全部迁移 + repository/事务测试 |
-| sync/worker | 注入假 `Client`：IDLE 通知、兜底触发、手动触发合并、退避、auth_failed 即停、UIDVALIDITY 重置 |
+| store | SQLite `:memory:` 跑全部迁移 + repository/事务测试；并发入库（多 goroutine 同时 `IngestMessage` 不得出现 `database is locked`）、外键子表索引存在（006 迁移） |
+| sync/worker | 注入假 `Client`：IDLE 通知、兜底触发、手动触发合并、退避、auth_failed 即停、UIDVALIDITY 重置；提醒开关运行时切换（不重启 worker）、令牌轮换后的内存快照 |
+| imapclient | `net.Pipe` 假服务器，断言线上命令（`EXAMINE`/`BODY.PEEK[]`、`UID SEARCH UID n:*`）：登录错误分类（拒绝 / 断连 / 无响应 / `* BYE`）、增量与分批拉取、IDLE 被 EXISTS 唤醒与收尾上限、看门狗（服务器静默、ctx 取消）、LOGOUT 上限 |
 | mstoken | `httptest` 模拟令牌端点：轮换返回、缓存命中、scope 隔离、invalid_grant、429 |
 | graphclient | `httptest` 模拟 Graph：分页列表、seen 去重、`$value` 原文、401→ErrReauth、游标参数透传 |
 | notify | `httptest` 收投递：断言签名头、重试梯度（注入时钟） |
-| api | `httptest` 全链路（内存库）：认证、分页、批量导入容错 |
+| api | `httptest` 全链路（内存库）：认证、分页、批量导入容错；提醒开关 PATCH → **运行中**的 worker（真实 Manager，验证控制面确实传到了 worker） |
 | 集成冒烟（手动） | 对单个真实测试邮箱跑完整收信 → webhook |
+
+超时/唤醒这类"不发生某件事"的缺陷，测试的有效性用**注入缺陷**验证：把看门狗关掉、去掉收尾上限、删掉唤醒回调……逐个改坏后对应测试必须失败（改坏后"只在超时后失败"的，测试自带 5s 守卫）。新增超时逻辑时照此做一遍，否则很容易写出永远通过的测试。
 
 ## 5. 构建与部署
 

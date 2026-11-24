@@ -52,8 +52,9 @@ type Manager struct {
 // 千级 worker 不允许直打 DB；30s 内的配置变更延迟可接受。
 const settingsTTL = 30 * time.Second
 
-// workerStopTimeout 停止单个 worker 时等待其真正退出的上限（IMAP/HTTP 均受 ctx 控制，
-// 正常远小于此值；超时只记日志，不无限阻塞调用方）。
+// workerStopTimeout 停止单个 worker 时等待其真正退出的上限。取消 ctx 会同时关闭该
+// worker 的 IMAP 连接（imapclient 的看门狗）、中断 Graph 的 HTTP 请求，正常远小于此值；
+// 超时只记日志，不无限阻塞调用方。
 const workerStopTimeout = 15 * time.Second
 
 type job struct {
@@ -129,6 +130,18 @@ func (m *Manager) RemoveAccount(id int64) {
 	m.cancelWorker(id)
 }
 
+// SetNotifyEnabled 即时更新运行中 worker 的提醒开关（PATCH notify_enabled 后由 API 调用，
+// 不重启 worker——不打断进行中的拉取和 IDLE 会话）。worker 当前不在运行（禁用、
+// auth_failed、排队中）时不做任何事：它下次启动时会从库里读到新值。
+func (m *Manager) SetNotifyEnabled(id int64, enabled bool) {
+	m.mu.Lock()
+	w, ok := m.workers[id]
+	m.mu.Unlock()
+	if ok {
+		w.setNotifyEnabled(enabled)
+	}
+}
+
 // TriggerNow 手动收取单账号（DESIGN.md 3.2：插入信号，不重置轮询计时）。
 // worker 尚未启动（排队中）时提升其队列优先级。
 func (m *Manager) TriggerNow(id int64) {
@@ -182,6 +195,7 @@ func (m *Manager) spawn(id int64) {
 		cancel:  cancel,
 		done:    make(chan struct{}),
 	}
+	w.setNotifyEnabled(acct.NotifyEnabled)
 	m.mu.Lock()
 	m.workers[id] = w
 	m.mu.Unlock()

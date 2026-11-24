@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"mailhub/internal/imapclient"
@@ -38,8 +39,13 @@ func (w *worker) initialSyncWindow() time.Duration {
 
 // worker 是单账号的同步状态机（TECH.md §2.6）。M1 为轮询模式。
 type worker struct {
-	m       *Manager
-	acct    *store.Account
+	m    *Manager
+	acct *store.Account
+	// notify 账号提醒开关的实时值：spawn 时取 acct.NotifyEnabled，之后由
+	// Manager.SetNotifyEnabled 原子更新——PATCH notify_enabled 不重启 worker 即时生效。
+	// 不能直接读 acct.NotifyEnabled：那是 worker 启动时的快照，改了库里的值它不会变。
+	notify atomic.Bool
+
 	trigger chan struct{} // cap=1：手动收取插入信号，非阻塞发送天然合并（DESIGN.md 3.2）
 	cancel  context.CancelFunc
 	done    chan struct{} // run 退出时关闭（Manager 据此等待旧 worker 真正停止；nil = 测试直构）
@@ -117,7 +123,10 @@ func (w *worker) session(ctx context.Context) error {
 			if e := w.m.store.UpdateCredential(w.acct.ID, enc); e != nil {
 				slog.Error("persist rotated refresh token failed", "account_id", w.acct.ID, "error", e)
 			} else {
-				cred.RefreshToken = rotated
+				// 内存快照也要更新：下个会话的 credentials() 解密的是 w.acct.CredentialEnc，
+				// 不更新的话它会一直用启动时的旧令牌——TokenCache 里存的是服务端返回的新
+				// 令牌，两者对不上，缓存永不命中，每个轮询周期都会再打一次令牌端点。
+				w.acct.CredentialEnc = enc
 				slog.Info("refresh token rotated", "account_id", w.acct.ID)
 			}
 		}
@@ -180,7 +189,7 @@ func (w *worker) idleLoop(ctx context.Context, cl mailclient.MailClient) error {
 			stopIdle()
 			<-ch
 			return ctx.Err()
-		case r := <-ch: // 服务器数据（EXISTS/EXPUNGE）或 IDLE 出错
+		case r := <-ch: // 服务器通告新邮件（EXISTS）或 IDLE 出错
 			timer.Stop()
 			stopIdle()
 			if r.err != nil && r.err != context.Canceled {
@@ -320,7 +329,7 @@ func (w *worker) ingest(folder string, key mailclient.MsgKey, seenAt time.Time, 
 		Truncated:      p.Truncated,
 		ParseError:     p.ParseError,
 		RawPath:        rel,
-		NotifyEnabled:  w.acct.NotifyEnabled && !historical, // 账号开关 AND 非历史邮件（DESIGN.md 5.1）
+		NotifyEnabled:  w.notify.Load() && !historical, // 账号开关 AND 非历史邮件（DESIGN.md 5.1）
 	}
 	for _, a := range p.Attachments {
 		nm.Attachments = append(nm.Attachments, store.NewAttachment{
@@ -354,6 +363,9 @@ func (w *worker) ingest(folder string, key mailclient.MsgKey, seenAt time.Time, 
 		"folder", folder, "uid", uid, "subject", p.Subject)
 	return nil
 }
+
+// setNotifyEnabled 更新提醒开关的实时值（spawn 初始化与 Manager.SetNotifyEnabled 共用）。
+func (w *worker) setNotifyEnabled(enabled bool) { w.notify.Store(enabled) }
 
 // credentials 解密账号凭据为明文（仅存内存）。
 func (w *worker) credentials() (mailclient.Credentials, error) {

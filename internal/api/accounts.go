@@ -597,6 +597,12 @@ func (s *Server) handleAccountPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 提醒开关即时生效：只更新运行中 worker 的实时值，不重启（不打断 IDLE 会话和进行中的
+	// 拉取）。worker 持有的是启动时的账号快照，不通知它的话开关要到下次重启才生效。
+	if body.NotifyEnabled != nil {
+		s.manager.SetNotifyEnabled(id, *body.NotifyEnabled)
+	}
+
 	// 连接类/周期类变更或重新启用 → 重启 worker；仅行为开关（notify/name/tags）→ 不重启。
 	restart := body.IMAPHost != nil || body.Username != nil || body.Password != nil ||
 		body.RefreshToken != nil || body.ClientID != nil || body.Folders != nil ||
@@ -720,6 +726,9 @@ func (s *Server) handleAccountBatchPatch(w http.ResponseWriter, r *http.Request)
 		p := store.AccountPatch{Enabled: body.Enabled, NotifyEnabled: body.NotifyEnabled}
 		if err := s.store.ApplyAccountPatch(id, p); err == nil {
 			updated++
+			if body.NotifyEnabled != nil {
+				s.manager.SetNotifyEnabled(id, *body.NotifyEnabled) // 即时生效，见 handleAccountPatch
+			}
 			if body.Enabled != nil {
 				if *body.Enabled {
 					s.manager.ReloadAccount(id)

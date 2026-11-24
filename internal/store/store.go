@@ -33,7 +33,13 @@ func Open(dbURL, dataDir string) (*Store, error) {
 			return nil, fmt.Errorf("创建数据目录: %w", err)
 		}
 		path := filepath.Join(dataDir, "mailhub.db")
-		db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+		// _txlock=immediate：事务一开始就取写锁（拿不到则等 busy_timeout）。默认的 deferred
+		// 事务是"先读后写"：WAL 下读快照建立后只要有别的连接提交过写，升级写锁就立即返回
+		// SQLITE_BUSY_SNAPSHOT（database is locked），busy_timeout 对它不生效。IngestMessage
+		// 正是"查重 SELECT → INSERT"，多 worker 并发入库时大量失败（实测 2 路并发约 3/4 失败，
+		// 账号被置 error 并退避重连）。本包的事务全部含写，immediate 没有副作用。
+		db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+
+			"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
 		if err != nil {
 			return nil, err
 		}

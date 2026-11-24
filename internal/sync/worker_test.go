@@ -148,7 +148,9 @@ func newTestWorker(t *testing.T, m *Manager, st *store.Store, email string, cl m
 		t.Fatal(err)
 	}
 	m.dial = func(*store.Account) mailclient.MailClient { return cl }
-	return &worker{m: m, acct: acct, trigger: make(chan struct{}, 1), cancel: func() {}}, id
+	w := &worker{m: m, acct: acct, trigger: make(chan struct{}, 1), cancel: func() {}}
+	w.setNotifyEnabled(acct.NotifyEnabled) // 与 spawn 一致：实时值取自账号快照
+	return w, id
 }
 
 func TestWorkerIngestAndHeartbeat(t *testing.T) {
@@ -412,10 +414,8 @@ func TestWorkerTokenRotationPersisted(t *testing.T) {
 func TestWorkerHistoryNoDelivery(t *testing.T) {
 	m, st, _ := testEnv(t)
 	cl := &fakeClient{msgs: map[string][]fakeMsg{"INBOX": {{uid: 1, raw: []byte(rawMail)}}}}
-	w, id := newTestWorker(t, m, st, "hist@x.com", cl)
-	acct, _ := st.GetAccount(id)
-	acct.NotifyEnabled = true
-	w.acct = acct
+	w, _ := newTestWorker(t, m, st, "hist@x.com", cl)
+	w.setNotifyEnabled(true) // 账号提醒开关开启
 	if _, err := st.CreateWebhook(&store.Webhook{URL: "http://127.0.0.1:1/hook", Secret: "s", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
